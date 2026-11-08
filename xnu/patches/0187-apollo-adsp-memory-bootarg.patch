@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -963,7 +963,12 @@
+ 
+ /* ---- step 2: the firmware -------------------------------------------------------------------------- */
+ 
+-#define ADSP_MEMORY             0x8bb00000u     /* dt: pil_adsp_region@8bb00000, memory-region of qcom,lpass@17300000 */
++/* apollo (xnu 0187): the DSP's memory is pil_adsp_region in the phone's own device tree: 0x8bb00000 on the Mi 10 and on
++ * the phone this port started on, 0x8a100000 on a Mi 10T with older firmware (MIUI 12.0.7, Android 10); same size.
++ * TrustZone refuses PAS_MEM_SETUP for an address outside the region (-3145798), so boot-arg apollo_adsp_mem=0x8a100000
++ * names it. Left out, it stays 0x8bb00000. */
++static uint32_t adsp_memory_base = 0x8bb00000u;
++#define ADSP_MEMORY             adsp_memory_base
+ #define ADSP_MEMORY_SIZE        0x02500000u
+ #define PAS_ADSP                1               /* dt: qcom,pas-id */
+ 
+@@ -3371,6 +3376,7 @@
+ 
+ 	/* apollo: no device=apollo from a loader here; this kernel is apollo's only */
+ 	PE_parse_boot_argn("apollo_adsp_step", &last_step, sizeof(last_step));
++	PE_parse_boot_argn("apollo_adsp_mem", &adsp_memory_base, sizeof(adsp_memory_base));
+ 	if (last_step == 0 && (!PE_parse_boot_argn("apollo_audio", &on, sizeof(on)) || on == 0)) {
+ 		return;
+ 	}
