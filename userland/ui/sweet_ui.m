@@ -92,15 +92,16 @@ sweet_sensorAreaRect(id self, SEL _cmd)
 		NSLog(@"sweet-ui: sensorAreaRect asked (%d): iOS says %@", logged, NSStringFromCGRect(r));
 	}
 
-	if (r.size.width >= 1.0 && r.size.height >= 1.0) {
-		return r;       /* a real exclusion area: keep it */
-	}
 	CGRect hole;
 	if (sweet_island_from_file(&hole)) {
+		/* the phone's own punch hole: wins over what iOS says (the iPhone X's notch, 209 x 30 pt, centred) */
 		if (logged < 5) {
 			NSLog(@"sweet-ui: island from /var/local/sweet-ui-island: %@", NSStringFromCGRect(hole));
 		}
 		return hole;
+	}
+	if (r.size.width >= 1.0 && r.size.height >= 1.0) {
+		return r;       /* a real exclusion area: keep it */
 	}
 	CGSize screen = [UIScreen mainScreen].bounds.size;
 	CGFloat width = screen.width < screen.height ? screen.width : screen.height;
