@@ -84,13 +84,22 @@ sweet_island_from_file(CGRect *out)
 static CGRect
 sweet_sensorAreaRect(id self, SEL _cmd)
 {
+	static int logged;
 	CGRect r = orig_sensorAreaRect(self, _cmd);
+
+	if (logged < 4) {
+		logged++;
+		NSLog(@"sweet-ui: sensorAreaRect asked (%d): iOS says %@", logged, NSStringFromCGRect(r));
+	}
 
 	if (r.size.width >= 1.0 && r.size.height >= 1.0) {
 		return r;       /* a real exclusion area: keep it */
 	}
 	CGRect hole;
 	if (sweet_island_from_file(&hole)) {
+		if (logged < 5) {
+			NSLog(@"sweet-ui: island from /var/local/sweet-ui-island: %@", NSStringFromCGRect(hole));
+		}
 		return hole;
 	}
 	CGSize screen = [UIScreen mainScreen].bounds.size;
