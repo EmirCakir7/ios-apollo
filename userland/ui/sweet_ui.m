@@ -57,6 +57,30 @@ sweet_objectForKey(id self, SEL _cmd, NSString *key)
 
 static CGRect (*orig_sensorAreaRect)(id, SEL);
 
+/*
+ * The Mi 10T's camera is a punch hole in the top-left corner, not a centred island. /var/local/sweet-ui-island
+ * ("x y width height" in points of the 375-wide canvas) names the rect the status bar lays out around; absent, the
+ * 14 Pro's centred island below is used.
+ */
+static BOOL
+sweet_island_from_file(CGRect *out)
+{
+	FILE *f = fopen("/var/local/sweet-ui-island", "r");
+	float x, y, w, h;
+	int n;
+
+	if (f == NULL) {
+		return NO;
+	}
+	n = fscanf(f, "%f %f %f %f", &x, &y, &w, &h);
+	fclose(f);
+	if (n != 4 || w <= 0.0f || h <= 0.0f) {
+		return NO;
+	}
+	*out = CGRectMake(x, y, w, h);
+	return YES;
+}
+
 static CGRect
 sweet_sensorAreaRect(id self, SEL _cmd)
 {
@@ -64,6 +88,10 @@ sweet_sensorAreaRect(id self, SEL _cmd)
 
 	if (r.size.width >= 1.0 && r.size.height >= 1.0) {
 		return r;       /* a real exclusion area: keep it */
+	}
+	CGRect hole;
+	if (sweet_island_from_file(&hole)) {
+		return hole;
 	}
 	CGSize screen = [UIScreen mainScreen].bounds.size;
 	CGFloat width = screen.width < screen.height ? screen.width : screen.height;
