@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -610,6 +610,7 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ #define SWEET_MOTION_MAX_US     5000000
+ 
+ static int gSweetMotionMode = -1;
++static unsigned gSweetMotionMask = 0xf;
+ static int gSweetGravity[3] = { 0, -1000, 0 };
+ static int gSweetLux = 300;
+ 
+@@ -617,6 +618,22 @@ static int gSweetLux = 300;
+ extern "C" int apollo_option(const char *name, int fallback);
+ #define SWEET_NO_VALUE 0x7fffffff
+ 
++/*
++ * (xnu 0194) Boot-arg / option sweetmotion_mask=N (default 0xf: all four, as before) leaves services out:
++ * bit 0 accel, bit 1 gyro, bit 2 prox, bit 3 ALS. To tell which of them makes backboardd crash.
++ */
++static unsigned
++sweet_motion_bit(UInt32 usage)
++{
++	switch (usage) {
++	case 3:  return 1;      /* accel */
++	case 9:  return 2;      /* gyro */
++	case 8:  return 4;      /* prox */
++	case 4:  return 8;      /* ALS */
++	}
++	return 0;
++}
++
+ static int
+ sweet_motion_mode(void)
+ {
+@@ -661,6 +678,7 @@ sweet_motion_mode(void)
+ 		if (lux >= 0) {
+ 			gSweetLux = lux;
+ 		}
++		gSweetMotionMask = (unsigned)apollo_option("sweetmotion_mask", 0xf) & 0xf;
+ 		gSweetMotionMode = mode < 0 ? 0 : mode;
+ 	}
+ 	return gSweetMotionMode;
+@@ -744,7 +762,14 @@ SweetHIDMotion::start(IOService *provider)
+ {
+ 	int mode = sweet_motion_mode();
+ 
+-	if (mode == 0 || !IOHIDEventService::start(provider)) {
++	if (mode == 0) {
++		return false;
++	}
++	if (!(gSweetMotionMask & sweet_motion_bit(getPrimaryUsage()))) {
++		IOLog("SWEET HID: %s left unregistered (sweetmotion_mask 0x%x)\n", getName(), gSweetMotionMask);
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+ 	fTimer = IOTimerEventSource::timerEventSource(this, &SweetHIDMotion::tick);
+@@ -753,8 +778,8 @@ SweetHIDMotion::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
+-	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, gravity %d,%d,%d mg)\n", getName(),
+-	    (unsigned)getPrimaryUsage(), mode, gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
++	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, mask 0x%x, gravity %d,%d,%d mg)\n", getName(),
++	    (unsigned)getPrimaryUsage(), mode, gSweetMotionMask, gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
+ 	if (mode >= 2) {
+ 		setInterval(1000000);
+ 	}
