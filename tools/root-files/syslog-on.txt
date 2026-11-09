@@ -1,6 +1,6 @@
 # Diagnosis of "Siri answers at once without listening" and "Weather shows no data" (Safari/YouTube work): their daemons log only
 # through os_log, which the kernel log never sees. xnu 0201 + libsweet-fix (userland/fix) copy the os_log of assistantd,
-# corespeechd, siriinferenced, siriknowledged, weatherd and the Weather app into the kernel log ("|assistantd| fixlog: E ..."),
+# corespeechd, siriinferenced, siriknowledged, weatherd, the Weather and Voice Memos apps, SpringBoard and backboardd into the kernel log ("|assistantd| fixlog: E ..."),
 # up to 800 lines each, errors and default-level lines always, the rest when they name speech, audio, trust, network, tokens,
 # location... Needs the option too: mkadt.py --option apollo_syslog=1 (default 0: nothing changes).
 # Only libsweet-fix.dylib, fresh from the userland build (it already sits on the root without the mirror list for these programs):

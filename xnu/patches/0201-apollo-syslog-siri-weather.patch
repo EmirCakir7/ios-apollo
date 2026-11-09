@@ -1,10 +1,12 @@
-xnu 0201: apollo_syslog=1 mirrors the os_log of Siri's and the Weather app's daemons into the kernel log
+xnu 0201: apollo_syslog=1 mirrors the os_log of Siri's, Weather's, Voice Memos' and the UI daemons' programs into the kernel log
 
-Siri answers "Uzgunum, tekrar eder misin?" at once, without listening, and Weather/Stocks show no data while Safari and YouTube
-work. Those programs say why only through os_log, which the kernel log never sees. libsweet-fix.dylib (userland/fix) already
-mirrors os_log for Files and usermanagerd; with apollo_syslog=1 (a boot-arg, else mkadt.py --option; DEFAULT 0: nothing changes)
-it is inserted into assistantd, corespeechd, siriinferenced, siriknowledged, weatherd and the Weather app too, and their names
-join sweetnull (the boot line is full, so neither goes through boot-args). Lines appear as "|assistantd| fixlog: E ...".
+Siri answers "Uzgunum, tekrar eder misin?" at once, without listening, Weather/Stocks show no data while Safari and YouTube work, and
+after a recording Voice Memos cannot be left (SpringBoard: "Unbalanced calls to begin/end appearance transitions for
+SBSwitcherViewController"). Those programs say why only through os_log, which the kernel log never sees. libsweet-fix.dylib
+(userland/fix) already mirrors os_log for Files and usermanagerd; with apollo_syslog=1 (a boot-arg, else mkadt.py --option;
+DEFAULT 0: nothing changes) it is inserted into assistantd, corespeechd, siriinferenced, siriknowledged, weatherd, SpringBoard,
+backboardd and the Weather and VoiceMemos apps too (added to the library a program already gets, so libsweet-ca/-ui stay),
+and the names join sweetnull (the boot line is full, so neither goes through boot-args). Lines: "|assistantd| fixlog: E ...".
 
 --- a/bsd/dev/mem.c
 +++ b/bsd/dev/mem.c
@@ -16,8 +18,8 @@ join sweetnull (the boot line is full, so neither goes through boot-args). Lines
 +
  			strlcat(sweet_null_names, ",fileproviderd,Files,LocalStorageFile,usermanagerd", sizeof(sweet_null_names));
 +			if (apollo_option("apollo_syslog", 0) >= 1) {
-+				/* (xnu 0201) the daemons kern_exec.c's sweet_exec_syslog gives libsweet-fix */
-+				strlcat(sweet_null_names, ",assistantd,corespeechd,siriinferenced,siriknowledged,weatherd,Weather",
++				/* (xnu 0201) the programs kern_exec.c's sweet_exec_syslog gives libsweet-fix (SpringBoard, backboardd: the boot line's list) */
++				strlcat(sweet_null_names, ",assistantd,corespeechd,siriinferenced,siriknowledged,weatherd,Weather,VoiceMemos",
 +				    sizeof(sweet_null_names));
 +			}
  		}
@@ -25,19 +27,21 @@ join sweetnull (the boot line is full, so neither goes through boot-args). Lines
  	}
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5640,6 +5640,32 @@
+@@ -5640,7 +5640,39 @@
  	return true;
  }
 
 +/*
-+ * (xnu 0201) apollo_syslog=1 (an option; default 0): libsweet-fix.dylib, which is on the root anyway, also goes into the daemons
-+ * that answer Siri and the Weather app, to copy their os_log into the kernel log (their names are added to sweetnull in
-+ * bsd/dev/mem.c; userland/fix's diag list). Only the mirror runs there, none of the fixes. Inserted only when the library is there.
++ * (xnu 0201) apollo_syslog=1 (an option; default 0): libsweet-fix.dylib, which is on the root anyway, also goes into the programs
++ * that answer Siri, the Weather app, Voice Memos, SpringBoard and backboardd, to copy their os_log into the kernel log (their
++ * names are added to sweetnull in bsd/dev/mem.c; userland/fix's diag list). Only the mirror runs there, none of the fixes. It is
++ * added to the library a program already gets (backboardd: libsweet-ca, SpringBoard and apps: libsweet-ui), when the file is there.
 + */
 +static bool
-+sweet_exec_syslog(const char *path, char *env, size_t size)
++sweet_exec_syslog(const char *path, bool had, char *env, size_t size)
 +{
-+	static const char *const names[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather" };
++	static const char *const names[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather",
++		                             "VoiceMemos", "SpringBoard", "backboardd" };
 +	const char *name = path;
 +
 +	for (const char *c = path; *c != 0; c++) {
@@ -48,22 +52,38 @@ join sweetnull (the boot line is full, so neither goes through boot-args). Lines
 +	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
 +		if (strcmp(name, names[i]) == 0 && apollo_option("apollo_syslog", 0) >= 1 &&
 +		    sweet_exec_file_exists("/usr/local/lib/libsweet-fix.dylib")) {
-+			snprintf(env, size, "DYLD_INSERT_LIBRARIES=/usr/local/lib/libsweet-fix.dylib");
++			if (had) {
++				strlcat(env, ":/usr/local/lib/libsweet-fix.dylib", size);
++			} else {
++				snprintf(env, size, "DYLD_INSERT_LIBRARIES=/usr/local/lib/libsweet-fix.dylib");
++			}
 +			return true;
 +		}
 +	}
-+	return false;
++	return had;
 +}
 +
  static bool
- sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
+-sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
++sweet_exec_inject_groups(struct image_params *imgp, char *env, size_t size)
  {
-@@ -5692,7 +5724,7 @@
+ 	char conf[200 + sizeof(SWEET_INJECT_BUILTIN) + 1];
+@@ -5692,7 +5725,18 @@
  		}
  		group += grouplen + (group[grouplen] == ';');
  	}
--	return sweet_exec_tweaks(path, env, size);
-+	return sweet_exec_tweaks(path, env, size) || sweet_exec_syslog(path, env, size);
+ 	return sweet_exec_tweaks(path, env, size);
  }
++
++static bool
++sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
++{
++	bool had = sweet_exec_inject_groups(imgp, env, size);
++
++	if (strncmp(imgp->ip_strings, EXECUTABLE_KEY, strlen(EXECUTABLE_KEY)) != 0) {
++		return had;
++	}
++	return sweet_exec_syslog(imgp->ip_strings + strlen(EXECUTABLE_KEY), had, env, size);
++}
  #endif
 

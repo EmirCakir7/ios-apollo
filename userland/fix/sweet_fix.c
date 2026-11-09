@@ -83,6 +83,7 @@ static const IMP fix_new[FIXES] = { (IMP)fix_setter_0, (IMP)fix_setter_1, (IMP)f
 static int mirror_on;
 static int mirror_all;          /* every level, not only errors and keyword lines (fileproviderd) */
 static int mirror_diag;         /* (xnu 0201, apollo_syslog=1) Siri's and Weather's daemons: failures and network/speech/trust words */
+static int mirror_ui;           /* ... SpringBoard, backboardd, Voice Memos: errors, faults, and lines naming transitions/audio/recording only */
 static unsigned mirror_max = MIRROR_MAX;
 static unsigned mirror_lines;
 
@@ -166,6 +167,23 @@ mirror_wanted(uint8_t type, const char *line)
 		"timed out", "offline", "network", "ttest", "dentity", "ctivat", "oken", "uth", "ntitle", "ocation", NULL
 	};
 
+	/* the home screen's chatter is too much at default level: what Voice Memos cannot be left over (appearance transitions, audio sessions) */
+	static const char *const ui_words[] = {
+		"nbalanced", "ppearance", "ransition", "ecord", "udio", "ession", "nterrupt", "VoiceMemo", "SBSwitcher",
+		"ssert", "xception", "imeout", "imed out", "ailed", "ancel", "ismiss", "deadlock", NULL
+	};
+
+	if (mirror_ui) {
+		if (type >= 0x10) {
+			return 1;
+		}
+		for (int i = 0; ui_words[i] != NULL; i++) {
+			if (strstr(line, ui_words[i]) != NULL) {
+				return 1;
+			}
+		}
+		return 0;
+	}
 	if (mirror_all || type == 0 || type >= 0x10) {   /* OS_LOG_TYPE_DEFAULT, _ERROR, _FAULT */
 		return 1;
 	}
@@ -571,7 +589,7 @@ sweet_fix_init(void)
 			}
 		}
 		/* (xnu 0201) inserted only with apollo_syslog=1: no fix of the programs above, only the mirror */
-		static const char *const diag[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather", NULL };
+		static const char *const diag[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather", NULL };   /* kern_exec.c's sweet_exec_syslog list, less the UI's below */
 
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {
@@ -579,10 +597,18 @@ sweet_fix_init(void)
 				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
 		}
+		static const char *const ui[] = { "SpringBoard", "backboardd", "VoiceMemos", NULL };
+
 		for (int i = 0; me != NULL && !mirror_on && diag[i] != NULL; i++) {
 			if (strcmp(me, diag[i]) == 0) {
 				mirror_on = mirror_diag = 1;
 				mirror_max = 800;
+			}
+		}
+		for (int i = 0; me != NULL && !mirror_on && ui[i] != NULL; i++) {
+			if (strcmp(me, ui[i]) == 0) {
+				mirror_on = mirror_diag = mirror_ui = 1;
+				mirror_max = 1500;
 			}
 		}
 		if (mirror_on && !mirror_diag && strcmp(me, "usermanagerd") != 0) {
