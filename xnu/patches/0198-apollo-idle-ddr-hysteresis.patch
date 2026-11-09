@@ -1,0 +1,56 @@
+xnu 0198: apollo_idle: the memory bus is raised only after 3 busy samples in a row (not one), lowered after 1 s quiet
+
+boot-idle1: with the display dark the bus flapped lowered/raised every few seconds; the raise fired on ONE 100 ms
+sample with a core >= 75% (a vmd/coreduetd burst, silver at 300 MHz), then 0.5 s quiet lowered it again, each change
+costing a measured-copy delay and a TCS vote. Now: raise after GOV_IDLE_BUSY_SAMPLES (3, ~300 ms) consecutive busy
+samples; lower after GOV_IDLE_QUIET_SAMPLES (10, ~1 s) quiet ones. Each raise logs "SWEET IDLE: memory bus to be
+raised: the busiest core N/1000 for K samples" before the "SWEET RPMH: memory bus raised" line.
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -99,7 +99,8 @@
+ #define GOV_QUIET_SAMPLES     62u         /* ... for this long (~1 s): the memory bus lowered */
+ #define GOV_START_S           15u
+ #define GOV_IDLE_QUIET_PERMILLE 400u      /* (0197) apollo_idle: every core under this ... */
+-#define GOV_IDLE_QUIET_SAMPLES  5u        /* ... for this many samples: the memory bus lowered */
++#define GOV_IDLE_QUIET_SAMPLES  10u       /* ... for this many samples (~1 s): the memory bus lowered (0198: was 5) */
++#define GOV_IDLE_BUSY_SAMPLES   3u        /* (0198) a core at GOV_FULL this many samples in a row: the bus raised */
+ #define GOV_IDLE_SETTLE_S       3u        /* the display dark this long before anything is slowed */
+ #define THERMAL_EVERY         16u         /* samples (~256 ms) */
+ #define TAME_EVERY            313u        /* samples (~5 s): sweet_cpu_tame() */
+@@ -352,7 +353,7 @@
+ 	uint32_t limit = 75, stats_s = 10, top = 1;
+ 	uint64_t idle_prev[GOV_CPUS] = { 0 }, at_prev = 0, period_abs, stats_abs, stats_since;
+ 	bool have_prev[GOV_CPUS] = { false };
+-	unsigned samples = 0, quiet = 0, ddr_top_samples = 0, stat_samples = 0, idle_samples = 0, dark_quiet = 0;
++	unsigned samples = 0, quiet = 0, ddr_top_samples = 0, stat_samples = 0, idle_samples = 0, dark_quiet = 0, dark_busy = 0;
+ 	bool ddr_top = true, idle = false, raise_pending = false;
+ 	struct gov_ddr ddr = { 0, 0, false, false };
+ 	uint64_t dark_since = 0, settle_abs;
+@@ -451,6 +452,7 @@
+ 					if (sweet_display_dark) {
+ 						idle = true;
+ 						dark_quiet = 0;
++						dark_busy = 0;
+ 						period_ms = (unsigned)idle_ms;
+ 						printf("SWEET IDLE: display dark for %u s: throttled: keys 80 ms, vsync 200 ms, governor %u ms, GPU watchdog "
+ 							"2 s, sweetlog flush 30 s, Wi-Fi MHI 10 ms, net thread 5/25 ms, backboardd profiler paused, memory bus %s\n",
+@@ -483,8 +485,15 @@
+ 				if (ddr.unsupported) {
+ 					printf("SWEET IDLE: the memory bus is not voted by the kernel (sweetddr=0, or its first vote failed): left alone\n");
+ 				}
+-			} else if (!ddr_top && busiest_all >= GOV_FULL_PERMILLE && now >= ddr.retry_at) {
+-				ddr_top = gov_ddr(true, ddr_top, "busy while the display is dark", true, &ddr);
++			} else if (!ddr_top && now >= ddr.retry_at) {
++				/* (0198) a burst of a daemon (vmd, coreduetd) for under 3 samples no longer raises it */
++				dark_busy = busiest_all >= GOV_FULL_PERMILLE ? dark_busy + 1 : 0;
++				if (dark_busy >= GOV_IDLE_BUSY_SAMPLES) {
++					printf("SWEET IDLE: memory bus to be raised: the busiest core %u/1000 for %u samples (%u ms)\n",
++						(unsigned)busiest_all, dark_busy, dark_busy * (unsigned)period_ms);
++					dark_busy = 0;
++					ddr_top = gov_ddr(true, ddr_top, "busy while the display is dark", true, &ddr);
++				}
+ 			}
+ 		} else if (now >= ddr.retry_at) {
+ 			if (!ddr_top && (quiet == 0 || raise_pending)) {
