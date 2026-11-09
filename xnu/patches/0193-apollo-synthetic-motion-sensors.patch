@@ -1,0 +1,256 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -590,3 +590,223 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * (xnu 0193) Synthetic motion sensors. The phone's real sensors sit behind the SLPI sensor hub, which the
++ * AP cannot poll, so for now these four services (an iPhone's aop-nub children: accel usage 3, gyro 9,
++ * prox 8, als 4 on page 0xff00) report fixed values at a low rate: gravity for the accelerometer, a
++ * still gyro, nothing near the proximity sensor and a constant light level. They let backboardd,
++ * SpringBoard, CoreMotion and CoreBrightness find sensors and show which of them open one
++ * ("SWEET HID: <service> open by <client>").
++ *
++ * Boot-arg sweetmotion=N: 0 (default) registers none of them; 1 reports while a client has set a
++ * non-zero ReportInterval (us, as the HID event system does to start and stop a sensor); 2 reports
++ * every second whatever the clients say. sweetgravity=x,y,z (milli-g; or sweetgx/sweetgy/sweetgz, which
++ * mkadt.py --option can carry too, as two's complement) is the vector the accelerometer reports, default
++ * 0,-1000,0 (portrait, upright); sweetlux=N the light.
++ */
++#define SWEET_PAGE_APPLE_VENDOR 0xff00
++#define SWEET_MOTION_MIN_US     100000          /* never faster than 10 Hz */
++#define SWEET_MOTION_MAX_US     5000000
++
++static int gSweetMotionMode = -1;
++static int gSweetGravity[3] = { 0, -1000, 0 };
++static int gSweetLux = 300;
++
++/* bsd/dev/apollo_pmic.c (xnu 0181): a boot-arg, else a /sweet-options value of the device tree (mkadt.py --option) */
++extern "C" int apollo_option(const char *name, int fallback);
++#define SWEET_NO_VALUE 0x7fffffff
++
++static int
++sweet_motion_mode(void)
++{
++	if (gSweetMotionMode < 0) {
++		static const char *const axes[3] = { "sweetgx", "sweetgy", "sweetgz" };
++		char grav[48] = "";
++		int mode = apollo_option("sweetmotion", 0);
++		for (int i = 0; i < 3; i++) {
++			int v = apollo_option(axes[i], SWEET_NO_VALUE);
++			if (v != SWEET_NO_VALUE) {
++				gSweetGravity[i] = v;
++			}
++		}
++		bool comma = false;
++		if (PE_parse_boot_argn("sweetgravity", grav, sizeof(grav))) {
++			for (const char *q = grav; *q; q++) {
++				comma |= *q == ',';
++			}
++		}
++		if (comma) {
++			const char *p = grav;
++			for (int i = 0; i < 3; i++) {
++				int sign = 1, val = 0;
++				while (*p == ' ') {
++					p++;
++				}
++				if (*p == '-') {
++					sign = -1;
++					p++;
++				}
++				while (*p >= '0' && *p <= '9') {
++					val = val * 10 + (*p++ - '0');
++				}
++				gSweetGravity[i] = sign * val;
++				if (*p != ',') {
++					break;
++				}
++				p++;
++			}
++		}
++		int lux = apollo_option("sweetlux", -1);
++		if (lux >= 0) {
++			gSweetLux = lux;
++		}
++		gSweetMotionMode = mode < 0 ? 0 : mode;
++	}
++	return gSweetMotionMode;
++}
++
++static IOFixed
++sweet_milli_fixed(int milli)
++{
++	return (IOFixed)(((int64_t)milli << 16) / 1000);
++}
++
++class SweetHIDMotion : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDMotion);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return SWEET_PAGE_APPLE_VENDOR; }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 0; }
++	virtual IOHIDEvent *makeEvent(uint64_t now __unused) { return NULL; }
++	void setInterval(UInt32 us);
++private:
++	static void tick(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fTimer;
++	UInt32 fInterval;       /* us; 0: stopped */
++	UInt32 fSeq;
++};
++OSDefineMetaClassAndStructors(SweetHIDMotion, IOHIDEventService);
++
++class SweetHIDAccel : public SweetHIDMotion {
++	OSDeclareDefaultStructors(SweetHIDAccel);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
++	{
++		return IOHIDEvent::accelerometerEvent(now, sweet_milli_fixed(gSweetGravity[0]),
++		           sweet_milli_fixed(gSweetGravity[1]), sweet_milli_fixed(gSweetGravity[2]));
++	}
++};
++OSDefineMetaClassAndStructors(SweetHIDAccel, SweetHIDMotion);
++
++class SweetHIDGyro : public SweetHIDMotion {
++	OSDeclareDefaultStructors(SweetHIDGyro);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 9; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 9; }
++	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
++	{
++		return IOHIDEvent::gyroEvent(now, 0, 0, 0);
++	}
++};
++OSDefineMetaClassAndStructors(SweetHIDGyro, SweetHIDMotion);
++
++class SweetHIDProx : public SweetHIDMotion {
++	OSDeclareDefaultStructors(SweetHIDProx);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 8; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 8; }
++	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
++	{
++		return IOHIDEvent::proximityEvent(now, (IOHIDProximityDetectionMask)0, 0);   /* far */
++	}
++};
++OSDefineMetaClassAndStructors(SweetHIDProx, SweetHIDMotion);
++
++class SweetHIDALS : public SweetHIDMotion {
++	OSDeclareDefaultStructors(SweetHIDALS);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 4; }       /* unverified */
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
++	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
++	{
++		return IOHIDEvent::ambientLightSensorEvent(now, (UInt32)gSweetLux);
++	}
++};
++OSDefineMetaClassAndStructors(SweetHIDALS, SweetHIDMotion);
++
++bool
++SweetHIDMotion::start(IOService *provider)
++{
++	int mode = sweet_motion_mode();
++
++	if (mode == 0 || !IOHIDEventService::start(provider)) {
++		return false;
++	}
++	fTimer = IOTimerEventSource::timerEventSource(this, &SweetHIDMotion::tick);
++	if (!fTimer || _hidWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fTimer);
++		return false;
++	}
++	registerService();
++	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, gravity %d,%d,%d mg)
++", getName(),
++	    (unsigned)getPrimaryUsage(), mode, gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
++	if (mode >= 2) {
++		setInterval(1000000);
++	}
++	return true;
++}
++
++void
++SweetHIDMotion::setInterval(UInt32 us)
++{
++	if (us != 0) {
++		us = us < SWEET_MOTION_MIN_US ? SWEET_MOTION_MIN_US : us > SWEET_MOTION_MAX_US ? SWEET_MOTION_MAX_US : us;
++	}
++	bool was = fInterval != 0;
++	fInterval = us;
++	if (us == 0) {
++		fTimer->cancelTimeout();
++	} else if (!was) {
++		fTimer->setTimeoutMS(10);       /* the first report comes at once */
++	}
++}
++
++IOReturn
++SweetHIDMotion::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *interval = dict ? OSDynamicCast(OSNumber, dict->getObject(kIOHIDReportIntervalKey)) : NULL;
++
++	if (interval && fTimer && sweet_motion_mode() == 1) {
++		UInt32 us = interval->unsigned32BitValue();
++		IOLog("SWEET HID: %s ReportInterval %u us
++", getName(), (unsigned)us);
++		setInterval(us);
++		setProperty(kIOHIDReportIntervalKey, (unsigned long long)us, 32);
++	}
++	return IOHIDEventService::setProperties(properties);
++}
++
++void
++SweetHIDMotion::tick(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDMotion *self = (SweetHIDMotion *)owner;
++	UInt32 us = self->fInterval;
++
++	if (us == 0) {
++		return;
++	}
++	IOHIDEvent *event = self->makeEvent(mach_absolute_time());
++	if (event) {
++		self->dispatchEvent(event);
++		event->release();
++	}
++	self->fSeq++;
++	sender->setTimeoutUS(us);
++}
+\ No newline at end of file
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -8,6 +8,26 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDAccel;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDAccel;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDGyro;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDGyro;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDProx;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDProx;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDALS;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDALS;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

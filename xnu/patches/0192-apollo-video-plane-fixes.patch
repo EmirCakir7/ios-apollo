@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -581,7 +581,21 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * (xnu 0192) A dictionary, as on the iPhone: VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
++	 * reads CFDictionaryGetValue(DisplayPipePlaneBaseAlignment, "PlaneBaseAlignmentLinear"). The plain number
++	 * published before made mediaserverd die on "-[__NSCFNumber objectForKey:]" as soon as a video played.
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (align != NULL && linear != NULL) {
++			align->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	/*
+ 	 * present() puts no surface on the panel while the GPU is still drawing into it
+ 	 * (sweet_gpu_surface_ready(), 0114). Said here, the CoreAnimation bridge leaves the
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -600,7 +600,13 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
+-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
++/*
++ * IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). A plane record (+0x68 + 0x80 i), as
++ * IOSurfaceGetWidth/Height/BaseAddress/BytesPerRow/BytesPerElementOfPlane read it: width +0, height +4,
++ * offset +0xc, bytes per row +0x10 (xnu 0192; it was written at +8 only, so every 420f/420v surface said 0
++ * bytes per row and the software H.264 decoder wrote through a bogus pointer), size +0x14, bytes per
++ * element +0x18, element width/height +0x1a/+0x1b. +8 still carries the row length too, as before.
++ */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+@@ -630,6 +636,7 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
