@@ -1,0 +1,405 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,28 @@
+  * 0x4000 and 0x4100 are logged ("SWEET BATT:"), READ ONLY, uninterpreted. Each 5-minute line also carries an
+  * EXPERIMENTAL BATT_INFO voltage (kFGVbatt, from memory of qpnp-fg-gen4: unverified until a log shows it). It is only
+  * logged, unless sweetbattery_fg=1 AND it passes the 2800-4600 mV check: then it replaces the static fallback.
++ *
++ * apollo (xnu 0190): (1) sweetbattery_fg=1 now publishes the fg-gen4's own state of charge instead of the static 100%:
++ * BATT_SOC_FG_MONOTONIC_SOC (0x4009, the same byte again at 0x400a; fg-reg.h, fg-util.c fg_get_msoc_raw) is 0..255, so
++ * raw * 100 / 255 percent (rounded; 0 and anything outside 1..100 is rejected and the static fallback stays). Every 5
++ * minutes, and when it changes, "SWEET BATT: SOC raw 0x.. -> N%" says what was read. Xiaomi's kernel then adds its own
++ * smoothing (fg_get_msoc: +3 from raw 20 on with qcom,fg-increase-100soc-time-2); that is not copied here. The voltage
++ * at 0x4158 of xnu 0188 was not a register at all (BATT_INFO_VBATT is 0xa0/0xa1, 122.07 uV per step); it is logged from
++ * the right place, as EXPERIMENTAL, and is never used.
++ * (2) boot-arg (or ADT option) apollo_chg=N, default 0 = no hardware write at all: the charger's USB input current
++ * limit, N x 100 mA, at most 30 (3.0 A: 15 W at 5 V; larger values are cut to 30 here). At start and every 30 seconds,
++ * only if: the SPMI channel of the PM8150B's USBIN peripheral (0x213) is owned by the apps EE; a charger is plugged in
++ * (USBIN INT_RT_STS bit 4) and the Type-C port is attached as a sink (TYPE_C_MISC_STATUS CC_ATTACHED, not SNK_SRC_MODE);
++ * and the source's Rp (TYPE_C_SNK_STATUS) is 1.5 A or 3 A. With Rp default (USB: 500 mA) the limit is cut down to
++ * 500 mA, never raised. The limit is written like smb5-lib.c's smblib_set_icl_current's "high current" mode: the
++ * register 0x1370 (USBIN_CURRENT_LIMIT_CFG, 50 mA per step; 3.0 A = 0x3c), and, only where they differ,
++ * USBIN_ICL_OPTIONS (0x1366) bit 0 set, CMD_ICL_OVERRIDE (0x1342) bit 0 clear, USBIN_LOAD_CFG (0x1365) bit 4 set
++ * (smblib_icl_override SW_OVERRIDE_HC_MODE). Each write is read back and logged. Nothing else is written: not the float
++ * voltage, the fast-charge current, the adapter-allow / PD / QC registers. No numeric battery temperature can be read
++ * here (fg-gen4 keeps it in its SRAM, BATT_TEMP_WORD 328, behind the MEM_IF), so the writes also need
++ * apollo_chg_notemp=1; they stop, and the previous values are written back, when the charger reports the battery hot
++ * (BATTERY_CHARGER_STATUS_7: HOT_SOFT, TOO_HOT or TOO_HOT_AFP), or the charger is unplugged. After a hot report the
++ * limit stays off until the next boot.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -30,11 +52,24 @@
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* bsd/dev/apollo_pmic.c (xnu 0181): a boot-arg, else the ADT's /sweet-options */
+ extern "C" int apollo_option(const char *name, int fallback);
++/* bsd/dev/apollo_pmic.c (xnu 0190): the USBIN peripheral's channel is ours; a write of its four ICL registers only */
++extern "C" int apollo_pmic_usbin_ours(void);
++extern "C" int apollo_pmic_usbin_write(unsigned reg, uint8_t value);
+ /* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
+ static unsigned sweet_battery_sid = 2;
+ static const unsigned kSweetDesignMAh = 5000;
+-/* EXPERIMENTAL (xnu 0188): fg-gen4 BATT_INFO VBATT_LSB/MSB, 16 bits, 8 V / 32768 per step */
+-static const unsigned kFGVbatt = 0x4158;
++/* EXPERIMENTAL, log only, never used: fg-gen4 BATT_INFO_VBATT_LSB/MSB (fg-reg.h: batt_info_base + 0xa0), 122.07 uV/step */
++static const unsigned kFGVbatt = 0x41a0;
++/* fg-gen4 BATT_SOC_FG_MONOTONIC_SOC and its copy (fg-reg.h: batt_soc_base + 0x09, 0x0a), 0..255 */
++static const unsigned kFGSoc = 0x4009;
++/* smb5-reg.h (CHGR 0x1000, USBIN 0x1300, TYPEC 0x1500) */
++static const unsigned kChgThermStatus = 0x100d; /* BATTERY_CHARGER_STATUS_7: HOT_SOFT 5, TOO_HOT 3, TOO_HOT_AFP 1 */
++static const unsigned kUsbinStatus = 0x1310;    /* USBIN INT_RT_STS: bit 4 USBIN_PLUGIN */
++static const unsigned kSnkStatus = 0x1506;      /* TYPE_C_SNK_STATUS: DETECTED_SRC_TYPE (Rp) in bits 6:0 */
++static const unsigned kTypecMisc = 0x150b;      /* TYPE_C_MISC_STATUS: bit 6 SNK_SRC_MODE, bit 0 CC_ATTACHED */
++static const unsigned kChgMaxUnits = 30;        /* apollo_chg: hard cap, 100 mA units = 3.0 A */
++/* the registers apollo_chg writes (index: 0 the limit, then the three of smblib_icl_override) */
++static const unsigned kChgRegs[4] = {0x1370, 0x1366, 0x1342, 0x1365};
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -49,6 +84,15 @@
+ 	bool fTimerAdded, fRunning, fReal, fFG;
+ 	int fLastMode;
+ 	unsigned fPolls;
++	unsigned fLastSoc;
++	/* apollo_chg (xnu 0190) */
++	unsigned fChgUnits, fChgTicks, fChgFails, fChgLastSnk;
++	bool fChgNoTemp, fChgChecked, fChgHot, fChgActive, fChgReadSaid;
++	bool fChgChanged[4];
++	uint8_t fChgSaved[4];
++	void chargeLimit(void);
++	void chargeRestore(const char *why);
++	bool chargeWrite(unsigned index, uint8_t value);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -95,6 +139,14 @@
+ 	}
+ 	fLastMode = -1;
+ 	fPolls = 0;
++	fLastSoc = ~0u;
++	fChgUnits = fChgTicks = fChgFails = 0;
++	fChgLastSnk = ~0u;
++	fChgNoTemp = fChgChecked = fChgHot = fChgActive = fChgReadSaid = false;
++	for (unsigned i = 0; i < 4; ++i) {
++		fChgChanged[i] = false;
++		fChgSaved[i] = 0;
++	}
+ 	return true;
+ }
+ 
+@@ -271,15 +323,29 @@
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	bool fgUsed = false;
++	unsigned fgPercent = 0;
+ 	if (!valid && fReal) {
+-		/* apollo (xnu 0188): EXPERIMENTAL fg-gen4 voltage; logged, and used only with sweetbattery_fg=1 */
+-		uint16_t rawFG = 0;
+-		bool read = readWord(kFGVbatt, &rawFG) && rawFG != 0 && rawFG != 0xffff;
+-		unsigned fgmv = read ? (unsigned)(((uint64_t)rawFG * 244141u) / 1000000u) : 0;
+-		bool sane = read && fgmv >= 2800 && fgmv <= 4600;
++		/* apollo (xnu 0190): the fg-gen4's monotonic SOC, 0..255 (fg_get_msoc_raw: read twice, both bytes must match) */
++		uint8_t rawSoc = 0, rawSocCp = 0;
++		bool socRead = false;
++		for (unsigned attempt = 0; attempt < 3 && !socRead; ++attempt) {
++			socRead = !sweet_spmi_read(sid, kFGSoc, &rawSoc) && !sweet_spmi_read(sid, kFGSoc + 1, &rawSocCp) &&
++			    rawSoc == rawSocCp;
++		}
++		unsigned pct = socRead ? ((unsigned)rawSoc * 100u + 127u) / 255u : 0;
++		bool sane = socRead && pct >= 1 && pct <= 100;
++		if (say || pct != fLastSoc) {
++			IOLog("SWEET BATT: SOC raw 0x%02x -> %u%%, %s%s\n", rawSoc, pct,
++			    !socRead ? "not read" : (sane ? "plausible" : "rejected"),
++			    fFG ? ", used" : ", not used (sweetbattery_fg=0)");
++		}
++		fLastSoc = pct;
+ 		if (say) {
+-			IOLog("SWEET BATT: SID %u fg-gen4 voltage (experimental) %#x -> %u mV, %s%s\n", sid, rawFG, fgmv,
+-			    sane ? "plausible" : "not plausible", fFG ? ", used" : ", not used (sweetbattery_fg=0)");
++			/* EXPERIMENTAL and never used: the gauge's battery voltage, to compare with Android's */
++			uint16_t rawFG = 0;
++			bool read = readWord(kFGVbatt, &rawFG);
++			IOLog("SWEET BATT: SID %u fg-gen4 voltage (experimental, never used) %#x -> %u mV%s\n", sid, rawFG,
++			    (unsigned)(((uint64_t)rawFG * 122070u) / 1000000u), read ? "" : " (not read)");
+ 		}
+ 		/* its charger state is the same smb5 as above; unread bytes stay zero (not charging) */
+ 		if (sane && fFG) {
+@@ -288,7 +354,8 @@
+ 			(void)!sweet_spmi_read(sid, 0x1006, &charger);
+ 			(void)!sweet_spmi_read(sid, 0x1007, &error);
+ 			(void)!sweet_spmi_read(sid, 0x100d, &temperature);
+-			mv = fgmv;
++			mv = 4200; /* not measured: the static value, as before */
++			fgPercent = pct;
+ 			valid = fgUsed = true;
+ 		}
+ 	}
+@@ -314,16 +381,174 @@
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	publish(full ? 100 : (fgUsed ? fgPercent : estimatePercent(mv)), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
+ 
++/* apollo (xnu 0190): write one of kChgRegs (by index), read it back, log both; true if it reads back as written */
++bool
++SweetBattery::chargeWrite(unsigned index, uint8_t value)
++{
++	uint8_t back = 0;
++	fChgChanged[index] = true;
++	bool wrote = apollo_pmic_usbin_write(kChgRegs[index], value) == 0;
++	bool read = !sweet_spmi_read(sweet_battery_sid, kChgRegs[index], &back);
++	IOLog("SWEET BATT: wrote %#06x %#x read back %#x%s\n", kChgRegs[index], value, back,
++	    !wrote ? " (write failed)" : (!read ? " (read back failed)" : ""));
++	return wrote && read && back == value;
++}
++
++/* the values the charger had before the first write, back (the limit first, then the mode bits) */
++void
++SweetBattery::chargeRestore(const char *why)
++{
++	if (!fChgActive) {
++		return;
++	}
++	IOLog("SWEET BATT: restoring the charger's previous values (%s)\n", why);
++	for (unsigned i = 0; i < 4; ++i) {
++		if (fChgChanged[i]) {
++			(void)chargeWrite(i, fChgSaved[i]);
++			fChgChanged[i] = false;
++		}
++	}
++	fChgActive = false;
++}
++
++/* apollo (xnu 0190): the input current limit of apollo_chg; every 30 s, see the comment at the top of this file */
++void
++SweetBattery::chargeLimit(void)
++{
++	const unsigned sid = sweet_battery_sid;
++	if (!fReal || fChgUnits == 0) {
++		return;
++	}
++	if (!fChgChecked) {
++		fChgChecked = true;
++		if (sid != 2) {
++			IOLog("SWEET BATT: apollo_chg is for the PM8150B (sweetbattery_sid=2) only: no write\n");
++			fChgUnits = 0;
++			return;
++		}
++		if (!apollo_pmic_usbin_ours()) {
++			IOLog("SWEET BATT: charger channel not ours, no write\n");
++			fChgUnits = 0;
++			return;
++		}
++		IOLog("SWEET BATT: apollo_chg=%u (%u mA): no numeric battery temperature can be read here (fg-gen4 keeps it in its "
++		    "SRAM); only the charger's hot flags are watched\n", fChgUnits, fChgUnits * 100);
++		if (!fChgNoTemp) {
++			IOLog("SWEET BATT: apollo_chg needs apollo_chg_notemp=1 as well: no write\n");
++			fChgUnits = 0;
++			return;
++		}
++	}
++	if (fChgHot) {
++		return;
++	}
++	uint8_t usb = 0, snk = 0, misc = 0, therm = 0, cur = 0, opt = 0, ovr = 0, load = 0;
++	if (sweet_spmi_read(sid, kUsbinStatus, &usb) || sweet_spmi_read(sid, kSnkStatus, &snk) ||
++	    sweet_spmi_read(sid, kTypecMisc, &misc) || sweet_spmi_read(sid, kChgThermStatus, &therm) ||
++	    sweet_spmi_read(sid, kChgRegs[0], &cur) || sweet_spmi_read(sid, kChgRegs[1], &opt) ||
++	    sweet_spmi_read(sid, kChgRegs[2], &ovr) || sweet_spmi_read(sid, kChgRegs[3], &load)) {
++		if (!fChgReadSaid) {
++			fChgReadSaid = true;
++			IOLog("SWEET BATT: apollo_chg: a charger register could not be read: no write\n");
++		}
++		return;
++	}
++	bool say = (fChgTicks++ % 10) == 0;
++	if (therm & 0x2a) { /* BAT_TEMP_STATUS_HOT_SOFT_BIT | TOO_HOT_BIT | TOO_HOT_AFP_BIT */
++		chargeRestore("battery hot");
++		fChgHot = true;
++		IOLog("SWEET BATT: the charger reports the battery hot (%#x): apollo_chg is off until the next boot\n", therm);
++		return;
++	}
++	bool present = (usb & 0x10) != 0;                       /* USBIN_PLUGIN_RT_STS_BIT */
++	bool attached = (misc & 0x01) != 0 && !(misc & 0x40);   /* CC_ATTACHED_BIT, and not SNK_SRC_MODE_BIT: we are the sink */
++	if (!present || !attached) {
++		chargeRestore("no charger attached");
++		fChgLastSnk = ~0u;
++		return;
++	}
++	/* smblib_get_prop_ufp_mode: the source's Rp; the debug accessory (DAM) and short cases are left alone */
++	unsigned rpUnits;
++	const char *rp;
++	switch (snk & 0x7f) { /* DETECTED_SRC_TYPE_MASK */
++	case 0x08: /* SNK_RP_STD_BIT */
++		rpUnits = 5;
++		rp = "Rp default (USB, 500 mA)";
++		break;
++	case 0x04: /* SNK_RP_1P5_BIT */
++		rpUnits = 15;
++		rp = "Rp 1.5 A";
++		break;
++	case 0x02: /* SNK_RP_3P0_BIT */
++		rpUnits = 30;
++		rp = "Rp 3 A";
++		break;
++	default:
++		if (snk != fChgLastSnk) {
++			fChgLastSnk = snk;
++			IOLog("SWEET BATT: Type-C sink status %#x is no usable Rp: no write\n", snk);
++		}
++		return;
++	}
++	if (snk != fChgLastSnk) {
++		fChgLastSnk = snk;
++		IOLog("SWEET BATT: Type-C sink status %#x: %s%s\n", snk, rp,
++		    rpUnits == 5 ? ": the limit is cut to 500 mA, not raised" : "");
++	}
++	const unsigned units = fChgUnits < rpUnits ? fChgUnits : rpUnits;
++	const uint8_t want = (uint8_t)(units * 2); /* USBIN_CURRENT_LIMIT_CFG: 50 mA per step */
++	if (say) {
++		IOLog("SWEET BATT: charge limit: %s, apollo_chg %u -> %u mA, %#06x is %#x (want %#x)\n", rp, fChgUnits,
++		    units * 100, kChgRegs[0], cur, want);
++	}
++	/* smblib_icl_override(SW_OVERRIDE_HC_MODE): USBIN_MODE_CHG 1 (0x1366 bit 0), ICL_OVERRIDE 0 (0x1342 bit 0),
++	 * ICL_OVERRIDE_AFTER_APSD 1 (0x1365 bit 4); only needed when the limit is raised above USB's 500 mA */
++	const bool high = units > 5;
++	const uint8_t optWant = (uint8_t)(opt | 0x01), ovrWant = (uint8_t)(ovr & ~0x01), loadWant = (uint8_t)(load | 0x10);
++	const bool modeOk = !high || (opt == optWant && ovr == ovrWant && load == loadWant);
++	if (high ? (cur == want && modeOk) : cur <= want) {
++		return; /* already as wanted (or already lower than the USB default) */
++	}
++	if (!fChgActive) {
++		fChgSaved[0] = cur;
++		fChgSaved[1] = opt;
++		fChgSaved[2] = ovr;
++		fChgSaved[3] = load;
++		fChgActive = true;
++	}
++	bool ok = true;
++	if (cur != want) {
++		ok = chargeWrite(0, want) && ok;
++	}
++	if (high && !modeOk) {
++		if (opt != optWant) {
++			ok = chargeWrite(1, optWant) && ok;
++		}
++		if (ovr != ovrWant) {
++			ok = chargeWrite(2, ovrWant) && ok;
++		}
++		if (load != loadWant) {
++			ok = chargeWrite(3, loadWant) && ok;
++		}
++	}
++	if (!ok && ++fChgFails >= 3) {
++		chargeRestore("writes do not stick");
++		fChgUnits = 0;
++		IOLog("SWEET BATT: apollo_chg gives up after 3 failed writes\n");
++	}
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
++		self->chargeLimit(); /* apollo (xnu 0190): nothing unless apollo_chg > 0 */
+ 		sender->setTimeoutMS(30000);
+ 	}
+ }
+@@ -338,6 +563,17 @@
+ 	sweet_battery_sid = (unsigned)apollo_option("sweetbattery_sid", 2);
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	fFG = apollo_option("sweetbattery_fg", 0) == 1;
++	/* apollo (xnu 0190): the input current limit, default off; 100 mA units, at most 3.0 A whatever is asked */
++	int chg = apollo_option("apollo_chg", 0);
++	fChgUnits = chg <= 0 ? 0u : ((unsigned)chg > kChgMaxUnits ? kChgMaxUnits : (unsigned)chg);
++	fChgNoTemp = apollo_option("apollo_chg_notemp", 0) == 1;
++	if ((unsigned)chg > kChgMaxUnits) {
++		IOLog("SWEET BATT: apollo_chg=%d is above the hard cap of %u (3.0 A): %u used\n", chg, kChgMaxUnits, kChgMaxUnits);
++	}
++	if (fChgUnits && !fReal) {
++		IOLog("SWEET BATT: apollo_chg needs sweetbattery=1: no write\n");
++		fChgUnits = 0;
++	}
+ 	if (fReal) {
+ 		/* apollo (xnu 0182): what answers at the charger's and the gauge's blocks (boot 121: all zeros, "NOT read") */
+ 		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48};
+@@ -391,6 +627,7 @@
+ 			fTimerAdded = true;
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(30000);
++			chargeLimit(); /* apollo (xnu 0190): once now, then every 30 s from timerFired */
+ 		} else {
+ 			fReal = false;
+ 			poll();
+--- a/bsd/dev/apollo_pmic.c
++++ b/bsd/dev/apollo_pmic.c
+@@ -22,7 +22,8 @@
+  *
+  * The SPMI arbiter (version 5) as sweet_backlight.c drives it: reads through the observer (0xe600000, 0x80 per channel),
+  * writes through the channel's own page of "chnls" (0xc600000, 0x10000 per channel). This file has its own lock; it
+- * only uses the channels of the clock (0x060), the flash LED (0x5d3) and nothing else.
++ * only uses the channels of the clock (0x060), the flash LED (0x5d3) and (xnu 0190, apollo_chg) the charger's USB input
++ * (0x213), and nothing else.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <stdbool.h>
+@@ -108,6 +109,7 @@
+ };
+ static struct periph rtc_periph = { .name = "the PM8150's clock", .id = 0x060 };
+ static struct periph flash_periph = { .name = "the PM8150L's flash LED", .id = 0x5d3 };
++static struct periph usbin_periph = { .name = "the PM8150B's USB input", .id = 0x213 };
+ 
+ static inline uint32_t
+ rd(vm_offset_t a)
+@@ -244,6 +246,33 @@
+ 	return spmi_write(p, reg, &value, 1);
+ }
+ 
++/* ---- the charger's USB input current limit (xnu 0190) ------------------------------------------------- */
++
++/*
++ * The PM8150B's smb5 USBIN peripheral (SID 2, 0x1300), for SweetBattery's apollo_chg: whether its SPMI channel is the
++ * apps EE's (the same ownership test as every other part here), and a write that only accepts the four registers
++ * smb5-lib.c's smblib_set_icl_current / smblib_icl_override touch (Xiaomi's smb5-reg.h, USBIN_BASE 0x1300):
++ * 0x42 CMD_ICL_OVERRIDE, 0x65 USBIN_LOAD_CFG, 0x66 USBIN_ICL_OPTIONS, 0x70 USBIN_CURRENT_LIMIT_CFG.
++ * Not an option of its own: nothing calls this unless SweetBattery has apollo_chg > 0.
++ */
++int apollo_pmic_usbin_ours(void);
++int apollo_pmic_usbin_write(unsigned reg, uint8_t value);
++
++int
++apollo_pmic_usbin_ours(void)
++{
++	return periph_find(&usbin_periph, true) ? 1 : 0;
++}
++
++int
++apollo_pmic_usbin_write(unsigned reg, uint8_t value)
++{
++	if (reg != 0x42 && reg != 0x65 && reg != 0x66 && reg != 0x70) {
++		return -1;
++	}
++	return spmi_write1(&usbin_periph, (uint8_t)reg, value);
++}
++
+ /* ---- the clock (PM8150 RTC: Linux's rtc-pm8xxx.c, pm8941_regs) ---------------------------------------- */
+ 
+ #define RTC_WRITE               0x40    /* 0x6040: 4 bytes, little endian */
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -105,7 +105,9 @@
+ 	    peripheral != 0x13 && peripheral != 0x48 &&
+ 	    /* apollo (xnu 0188): the PM8150B's fuel gauge (fg-gen4: 0x40 SOC, 0x41 BATT_INFO, 0x42 RRADC, 0x43 MEM_IF) and
+ 	     * its ADC5 (0x31), to be read, as before: this file writes nothing */
+-	    (peripheral < 0x40 || peripheral > 0x43) && peripheral != 0x31)) {
++	    (peripheral < 0x40 || peripheral > 0x43) && peripheral != 0x31 &&
++	    /* apollo (xnu 0190): the smb5's TYPEC block (0x15: Rp, CC attach), to be read as before */
++	    peripheral != 0x15)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
