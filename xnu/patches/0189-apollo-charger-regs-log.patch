@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -365,6 +365,22 @@
+ 		dumpWindow(0x4100, 0x00);
+ 		dumpWindow(0x4100, 0x50);
+ 		dumpWindow(0x4100, 0x60);
++		/* apollo (xnu 0189): the smb5 charger's configuration, raw (offsets: Xiaomi's smb5-reg.h for the SM8250) */
++		static const struct {
++			unsigned address;
++			const char *name;
++		} chargerRegs[] = {
++			{0x1006, "BATTERY_CHARGER_STATUS_1"}, {0x1061, "CHGR_FAST_CHARGE_CURRENT_CFG"},
++			{0x1070, "CHGR_FLOAT_VOLTAGE_CFG"}, {0x1308, "APSD_RESULT_STATUS"}, {0x1342, "CMD_ICL_OVERRIDE"},
++			{0x1360, "USBIN_ADAPTER_ALLOW_CFG"}, {0x1365, "USBIN_LOAD_CFG"}, {0x1366, "USBIN_ICL_OPTIONS"},
++			{0x1370, "USBIN_CURRENT_LIMIT_CFG (50 mA/step)"}, {0x1381, "USBIN_5V_AICL_THRESHOLD"},
++		};
++		for (unsigned i = 0; i < sizeof(chargerRegs) / sizeof(chargerRegs[0]); ++i) {
++			uint8_t value = 0;
++			bool ok = !sweet_spmi_read(sweet_battery_sid, chargerRegs[i].address, &value);
++			IOLog("SWEET BATT: SID %u charger %#06x %s: %s %#x\n", sweet_battery_sid, chargerRegs[i].address,
++			    chargerRegs[i].name, ok ? "read," : "NOT read,", value);
++		}
+ 	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
