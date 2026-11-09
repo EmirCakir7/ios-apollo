@@ -1,0 +1,206 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -613,6 +614,8 @@
+ static unsigned gSweetMotionMask = 0xf;
+ static int gSweetGravity[3] = { 0, -1000, 0 };
+ static int gSweetLux = 300;
++static int gSweetLuxHi = 0;             /* (xnu 0199) sweetlux_hi=N: the light swings between sweetlux and N */
++static IOLock *gSweetPropLock;
+ 
+ /* bsd/dev/apollo_pmic.c (xnu 0181): a boot-arg, else a /sweet-options value of the device tree (mkadt.py --option) */
+ extern "C" int apollo_option(const char *name, int fallback);
+@@ -680,6 +683,8 @@
+ 		if (lux >= 0) {
+ 			gSweetLux = lux;
+ 		}
++		gSweetLuxHi = apollo_option("sweetlux_hi", 0);
++		gSweetPropLock = IOLockAlloc();
+ 		gSweetMotionMask = (unsigned)apollo_option("sweetmotion_mask", 0xf) & 0x1f;
+ 		gSweetMotionMode = mode < 0 ? 0 : mode;
+ 	}
+@@ -708,12 +713,50 @@
+ 	}
+ }
+ 
++/*
++ * (xnu 0199) What the clients ask of a sensor service: each (service, key) pair is logged once, as
++ * "SWEET HID: <service> property query '<key>': found|not there". A key that CoreBrightness or CoreMotion
++ * wants and the service lacks shows here, as does a service no client ever asks about.
++ */
++#define SWEET_PROP_SEEN_MAX 128
++#define SWEET_PROP_TAG_LEN  72
++static char gSweetPropSeen[SWEET_PROP_SEEN_MAX][SWEET_PROP_TAG_LEN];
++static unsigned gSweetPropSeenCount;
++
++static void
++sweet_log_property_query(const char *service, const char *key, bool found)
++{
++	char tag[SWEET_PROP_TAG_LEN];
++
++	if (!gSweetPropLock || !service || !key) {
++		return;
++	}
++	snprintf(tag, sizeof(tag), "%s/%s", service, key);
++	IOLockLock(gSweetPropLock);
++	for (unsigned i = 0; i < gSweetPropSeenCount; i++) {
++		if (strncmp(gSweetPropSeen[i], tag, sizeof(tag)) == 0) {
++			IOLockUnlock(gSweetPropLock);
++			return;
++		}
++	}
++	if (gSweetPropSeenCount < SWEET_PROP_SEEN_MAX) {
++		strlcpy(gSweetPropSeen[gSweetPropSeenCount++], tag, sizeof(gSweetPropSeen[0]));
++	}
++	IOLockUnlock(gSweetPropLock);
++	IOLog("SWEET HID: %s property query '%s': %s\n", service, key, found ? "found" : "not there");
++}
++
+ class SweetHIDMotion : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDMotion);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	virtual bool open(IOService *client, IOOptionBits options, void *context, Action action) APPLE_KEXT_OVERRIDE;
++	virtual void close(IOService *forClient, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	using IOHIDEventService::copyProperty;
++	virtual OSObject *copyProperty(const OSSymbol *key) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject *copyProperty(const OSString *key) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject *copyProperty(const char *key) const APPLE_KEXT_OVERRIDE;
+ 	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return SWEET_PAGE_APPLE_VENDOR; }
+@@ -721,7 +764,7 @@
+ 	virtual IOHIDEventType sweetEventType() { return (IOHIDEventType)0; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now __unused) { return NULL; }
+ 	/* what a tick sends (us: the tick period, 0 for the one-shot after an open); NULL sends nothing */
+-	virtual IOHIDEvent *nextEvent(uint64_t now, UInt32 us __unused) { return makeEvent(now); }
++	virtual IOHIDEvent *nextEvent(uint64_t now, UInt32 us);
+ 	void setInterval(UInt32 us);
+ private:
+ 	static void tick(OSObject *owner, IOTimerEventSource *sender);
+@@ -729,6 +772,8 @@
+ 	UInt32 fInterval;       /* us; 0: stopped */
+ 	UInt32 fSeq;
+ 	volatile bool fPoke;    /* one report after an open, whatever the interval */
++	UInt32 fCount;          /* (xnu 0199) events the default nextEvent made */
++	UInt32 fCountLogUs;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDMotion, IOHIDEventService);
+ 
+@@ -788,17 +833,39 @@
+ 	OSDeclareDefaultStructors(SweetHIDALS);
+ protected:
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 4; }       /* unverified */
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("ALS"); }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
+ 	{
+-		IOHIDEvent *e = IOHIDEvent::ambientLightSensorEvent(now, (UInt32)gSweetLux);
++		IOHIDEvent *e = IOHIDEvent::ambientLightSensorEvent(now, (UInt32)(fHigh ? gSweetLuxHi : gSweetLux));
+ 		if (e) {
+ 			sweet_add_sensor_time(e, now);
+ 		}
+ 		return e;
+ 	}
++	virtual IOHIDEvent *nextEvent(uint64_t now, UInt32 us) APPLE_KEXT_OVERRIDE;
+ 	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeAmbientLightSensor; }
++private:
++	bool fHigh;             /* (xnu 0199) sweetlux_hi: the swing's current half */
++	UInt32 fSwingUs;
+ };
++
++/* (xnu 0199) sweetlux_hi=N swaps the light between sweetlux and N every 20 s: auto-brightness, once the switch is
++ * there and on, then makes the screen brighter and dimmer by itself. */
++#define SWEET_LUX_SWING_US 20000000
++IOHIDEvent *
++SweetHIDALS::nextEvent(uint64_t now, UInt32 us)
++{
++	if (gSweetLuxHi > 0 && us != 0) {
++		fSwingUs += us;
++		if (fSwingUs >= SWEET_LUX_SWING_US) {
++			fSwingUs = 0;
++			fHigh = !fHigh;
++			IOLog("SWEET HID: SweetHIDALS light now %d lux\n", fHigh ? gSweetLuxHi : gSweetLux);
++		}
++	}
++	return SweetHIDMotion::nextEvent(now, us);
++}
+ OSDefineMetaClassAndStructors(SweetHIDALS, SweetHIDMotion);
+ 
+ /*
+@@ -935,7 +1002,10 @@
+ SweetHIDMotion::open(IOService *client, IOOptionBits options, void *context, Action action)
+ {
+ 	bool ok = IOHIDEventService::open(client, options, context, action);
++	char name[32];
+ 
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET HID: %s open by %s (%s)\n", getName(), name, ok ? "ok" : "refused");
+ 	if (ok && fTimer) {
+ 		/* a client that has just opened gets the current value at once, whatever the interval */
+ 		fPoke = true;
+@@ -944,6 +1014,56 @@
+ 	return ok;
+ }
+ 
++void
++SweetHIDMotion::close(IOService *forClient, IOOptionBits options)
++{
++	char name[32];
++
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET HID: %s closed by %s\n", getName(), name);
++	IOHIDEventService::close(forClient, options);
++}
++
++OSObject *
++SweetHIDMotion::copyProperty(const OSSymbol *key) const
++{
++	OSObject *value = IOHIDEventService::copyProperty(key);
++
++	sweet_log_property_query(getName(), key ? key->getCStringNoCopy() : NULL, value != NULL);
++	return value;
++}
++
++OSObject *
++SweetHIDMotion::copyProperty(const OSString *key) const
++{
++	OSObject *value = IOHIDEventService::copyProperty(key);
++
++	sweet_log_property_query(getName(), key ? key->getCStringNoCopy() : NULL, value != NULL);
++	return value;
++}
++
++OSObject *
++SweetHIDMotion::copyProperty(const char *key) const
++{
++	OSObject *value = IOHIDEventService::copyProperty(key);
++
++	sweet_log_property_query(getName(), key, value != NULL);
++	return value;
++}
++
++IOHIDEvent *
++SweetHIDMotion::nextEvent(uint64_t now, UInt32 us)
++{
++	fCountLogUs += us;
++	fCount++;
++	if (fCountLogUs >= 10000000) {
++		fCountLogUs = 0;
++		IOLog("SWEET HID: %s %u events sent, %u clients\n", getName(), (unsigned)fCount,
++		    _clients ? (unsigned)_clients->getCount() : 0);
++	}
++	return makeEvent(now);
++}
++
+ IOHIDEvent *
+ SweetHIDMotion::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
+ {
