@@ -82,6 +82,8 @@ static const IMP fix_new[FIXES] = { (IMP)fix_setter_0, (IMP)fix_setter_1, (IMP)f
 #define MIRROR_MAX 3000u
 static int mirror_on;
 static int mirror_all;          /* every level, not only errors and keyword lines (fileproviderd) */
+static int mirror_diag;         /* (xnu 0201, apollo_syslog=1) Siri's and Weather's daemons: failures and network/speech/trust words */
+static unsigned mirror_max = MIRROR_MAX;
 static unsigned mirror_lines;
 
 /* the format with os_log's encoded arguments after it (scalars as |N, C strings as |text) */
@@ -158,8 +160,21 @@ mirror_wanted(uint8_t type, const char *line)
 			return 0;
 		}
 	}
+	/* what Siri's speech path and the weather fetch say when they give up (xnu 0201) */
+	static const char *const diag_words[] = {
+		"peech", "iri", "eather", "ASR", "udio", "ecogni", "ertificate", "rust", "NSURL", "nsurl", "NSError", "Domain=",
+		"timed out", "offline", "network", "ttest", "dentity", "ctivat", "oken", "uth", "ntitle", "ocation", NULL
+	};
+
 	if (mirror_all || type == 0 || type >= 0x10) {   /* OS_LOG_TYPE_DEFAULT, _ERROR, _FAULT */
 		return 1;
+	}
+	if (mirror_diag) {
+		for (int i = 0; diag_words[i] != NULL; i++) {
+			if (strstr(line, diag_words[i]) != NULL) {
+				return 1;
+			}
+		}
 	}
 	for (int i = 0; words[i] != NULL; i++) {
 		if (strstr(line, words[i]) != NULL) {
@@ -175,7 +190,7 @@ mirror(uint8_t type, const char *format, const uint8_t *buf, uint32_t size)
 	static char last[1400];
 	char line[1400];
 
-	if (!mirror_on || format == NULL || mirror_lines >= MIRROR_MAX) {
+	if (!mirror_on || format == NULL || mirror_lines >= mirror_max) {
 		return;
 	}
 	mirror_decode(line, sizeof(line), format, buf, size);
@@ -183,8 +198,8 @@ mirror(uint8_t type, const char *format, const uint8_t *buf, uint32_t size)
 		return;
 	}
 	strlcpy(last, line, sizeof(last));
-	if (++mirror_lines == MIRROR_MAX) {
-		fprintf(stderr, "fixlog: %u lines: the rest is not copied\n", MIRROR_MAX);
+	if (++mirror_lines == mirror_max) {
+		fprintf(stderr, "fixlog: %u lines: the rest is not copied\n", mirror_max);
 		return;
 	}
 	fprintf(stderr, "fixlog: %c %s\n", type == 0x11 ? 'F' : type == 0x10 ? 'E' : type == 2 ? 'D' : 'I', line);
@@ -555,13 +570,22 @@ sweet_fix_init(void)
 				fix_start_metal_probe();
 			}
 		}
+		/* (xnu 0201) inserted only with apollo_syslog=1: no fix of the programs above, only the mirror */
+		static const char *const diag[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather", NULL };
+
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {
 				mirror_on = 1;
 				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
 		}
-		if (mirror_on && strcmp(me, "usermanagerd") != 0) {
+		for (int i = 0; me != NULL && !mirror_on && diag[i] != NULL; i++) {
+			if (strcmp(me, diag[i]) == 0) {
+				mirror_on = mirror_diag = 1;
+				mirror_max = 800;
+			}
+		}
+		if (mirror_on && !mirror_diag && strcmp(me, "usermanagerd") != 0) {
 			int a = hook_jump("statfs", (void *)fix_statfs);
 			int b = hook_jump("fstatfs", (void *)fix_fstatfs);
 			int c = hook_jump("getfsstat", (void *)fix_getfsstat);

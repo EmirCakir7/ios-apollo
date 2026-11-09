@@ -1,0 +1,69 @@
+xnu 0201: apollo_syslog=1 mirrors the os_log of Siri's and the Weather app's daemons into the kernel log
+
+Siri answers "Uzgunum, tekrar eder misin?" at once, without listening, and Weather/Stocks show no data while Safari and YouTube
+work. Those programs say why only through os_log, which the kernel log never sees. libsweet-fix.dylib (userland/fix) already
+mirrors os_log for Files and usermanagerd; with apollo_syslog=1 (a boot-arg, else mkadt.py --option; DEFAULT 0: nothing changes)
+it is inserted into assistantd, corespeechd, siriinferenced, siriknowledged, weatherd and the Weather app too, and their names
+join sweetnull (the boot line is full, so neither goes through boot-args). Lines appear as "|assistantd| fixlog: E ...".
+
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -181,7 +181,14 @@
+ 		 */
+ 		(void)PE_parse_boot_argn("sweetfix", &fix, sizeof(fix));
+ 		if (fix != 0 && strcmp(sweet_null_names, "-") != 0) {
++			extern int apollo_option(const char *name, int fallback);                      /* bsd/dev/apollo_pmic.c */
++
+ 			strlcat(sweet_null_names, ",fileproviderd,Files,LocalStorageFile,usermanagerd", sizeof(sweet_null_names));
++			if (apollo_option("apollo_syslog", 0) >= 1) {
++				/* (xnu 0201) the daemons kern_exec.c's sweet_exec_syslog gives libsweet-fix */
++				strlcat(sweet_null_names, ",assistantd,corespeechd,siriinferenced,siriknowledged,weatherd,Weather",
++				    sizeof(sweet_null_names));
++			}
+ 		}
+ 		sweet_null_parsed = 1;
+ 	}
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5640,6 +5640,32 @@
+ 	return true;
+ }
+
++/*
++ * (xnu 0201) apollo_syslog=1 (an option; default 0): libsweet-fix.dylib, which is on the root anyway, also goes into the daemons
++ * that answer Siri and the Weather app, to copy their os_log into the kernel log (their names are added to sweetnull in
++ * bsd/dev/mem.c; userland/fix's diag list). Only the mirror runs there, none of the fixes. Inserted only when the library is there.
++ */
++static bool
++sweet_exec_syslog(const char *path, char *env, size_t size)
++{
++	static const char *const names[] = { "assistantd", "corespeechd", "siriinferenced", "siriknowledged", "weatherd", "Weather" };
++	const char *name = path;
++
++	for (const char *c = path; *c != 0; c++) {
++		if (*c == '/') {
++			name = c + 1;
++		}
++	}
++	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (strcmp(name, names[i]) == 0 && apollo_option("apollo_syslog", 0) >= 1 &&
++		    sweet_exec_file_exists("/usr/local/lib/libsweet-fix.dylib")) {
++			snprintf(env, size, "DYLD_INSERT_LIBRARIES=/usr/local/lib/libsweet-fix.dylib");
++			return true;
++		}
++	}
++	return false;
++}
++
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5692,7 +5724,7 @@
+ 		}
+ 		group += grouplen + (group[grouplen] == ';');
+ 	}
+-	return sweet_exec_tweaks(path, env, size);
++	return sweet_exec_tweaks(path, env, size) || sweet_exec_syslog(path, env, size);
+ }
+ #endif
+
