@@ -1,0 +1,169 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -102,7 +102,10 @@
+ 	/* apollo (xnu 0182): SID 2 too, the Mi 10T's PM8150B (charger + fuel gauge; sweet's PM6150 is SID 0) */
+ 	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 &&
++	    /* apollo (xnu 0188): the PM8150B's fuel gauge (fg-gen4: 0x40 SOC, 0x41 BATT_INFO, 0x42 RRADC, 0x43 MEM_IF) and
++	     * its ADC5 (0x31), to be read, as before: this file writes nothing */
++	    (peripheral < 0x40 || peripheral > 0x43) && peripheral != 0x31)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -10,6 +10,12 @@
+  * bsd/dev/apollo_pmic.c: the boot line is full); sweetbattery_sid (default 2) picks the slave. Every 10th poll
+  * (5 min) logs the raw values, so a log shows whether the gauge's last-ADC registers move at all without Android's
+  * QG driver running.
++ *
++ * apollo (xnu 0188): the Mi 10T's gauge is not a QG but the PM8150B's fg-gen4 (blocks 0x4000 SOC, 0x4100 BATT_INFO,
++ * 0x4200 RRADC, 0x4300 MEM_IF; the ADC5 is 0x3100). At start the blocks' type/subtype/revision and a raw window of
++ * 0x4000 and 0x4100 are logged ("SWEET BATT:"), READ ONLY, uninterpreted. Each 5-minute line also carries an
++ * EXPERIMENTAL BATT_INFO voltage (kFGVbatt, from memory of qpnp-fg-gen4: unverified until a log shows it). It is only
++ * logged, unless sweetbattery_fg=1 AND it passes the 2800-4600 mV check: then it replaces the static fallback.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -27,6 +33,8 @@
+ /* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
+ static unsigned sweet_battery_sid = 2;
+ static const unsigned kSweetDesignMAh = 5000;
++/* EXPERIMENTAL (xnu 0188): fg-gen4 BATT_INFO VBATT_LSB/MSB, 16 bits, 8 V / 32768 per step */
++static const unsigned kFGVbatt = 0x4158;
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -38,7 +46,7 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fFG;
+ 	int fLastMode;
+ 	unsigned fPolls;
+ 	void putNumber(const char *key, UInt32 value);
+@@ -49,6 +57,7 @@
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
++	static void dumpWindow(unsigned base, unsigned first);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -64,7 +73,7 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fFG = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -197,6 +206,23 @@
+ 	return false;
+ }
+ 
++/* apollo (xnu 0188): 16 raw bytes of a block from `first`, "--" where a read failed. Read only, not interpreted. */
++void
++SweetBattery::dumpWindow(unsigned base, unsigned first)
++{
++	char line[16 * 3 + 1];
++	unsigned n = 0;
++	for (unsigned i = 0; i < 16; ++i) {
++		uint8_t value;
++		if (sweet_spmi_read(sweet_battery_sid, base + first + i, &value)) {
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, "-- ");
++		} else {
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, "%02x ", value);
++		}
++	}
++	IOLog("SWEET BATT: SID %u %#06x: %s\n", sweet_battery_sid, base + first, line);
++}
++
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -235,7 +261,8 @@
+ 	    !sweet_spmi_read(sid, 0x1007, &error) &&
+ 	    !sweet_spmi_read(sid, 0x100d, &temperature);
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	if (fReal && (fPolls++ % 10) == 0) {
++	bool say = fReal && (fPolls++ % 10) == 0;
++	if (say) {
+ 		/* apollo: what the gauge and the charger say, raw (every 5 minutes) */
+ 		IOLog("SWEET BATTERY: SID %u: gauge type %#x present %#x voltage %#x (%u mV); usb %#x path %#x charger %#x "
+ 		    "error %#x temperature flags %#x; %s\n", sid, type, present, rawVoltage, mv, usb, path, charger, error,
+@@ -243,6 +270,28 @@
+ 	}
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
++	bool fgUsed = false;
++	if (!valid && fReal) {
++		/* apollo (xnu 0188): EXPERIMENTAL fg-gen4 voltage; logged, and used only with sweetbattery_fg=1 */
++		uint16_t rawFG = 0;
++		bool got = readWord(kFGVbatt, &rawFG) && rawFG != 0 && rawFG != 0xffff;
++		unsigned fgmv = got ? (unsigned)(((uint64_t)rawFG * 244141u) / 1000000u) : 0;
++		bool sane = got && fgmv >= 2800 && fgmv <= 4600;
++		if (say) {
++			IOLog("SWEET BATT: SID %u fg-gen4 voltage (experimental) %#x -> %u mV, %s%s\n", sid, rawFG, fgmv,
++			    sane ? "plausible" : "not plausible", fFG ? ", used" : ", not used (sweetbattery_fg=0)");
++		}
++		/* its charger state is the same smb5 as above; unread bytes stay zero (not charging) */
++		if (sane && fFG) {
++			(void)!sweet_spmi_read(sid, 0x1310, &usb);
++			(void)!sweet_spmi_read(sid, 0x110b, &path);
++			(void)!sweet_spmi_read(sid, 0x1006, &charger);
++			(void)!sweet_spmi_read(sid, 0x1007, &error);
++			(void)!sweet_spmi_read(sid, 0x100d, &temperature);
++			mv = fgmv;
++			valid = fgUsed = true;
++		}
++	}
+ 	if (!valid) {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+@@ -257,7 +306,7 @@
+ 	int ma = 0;
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(sid, 0x4805, &subtype) &&
++	bool currentValid = !fgUsed && !sweet_spmi_read(sid, 0x4805, &subtype) &&
+ 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+@@ -288,6 +337,7 @@
+ 	int real = apollo_option("sweetbattery", 0);
+ 	sweet_battery_sid = (unsigned)apollo_option("sweetbattery_sid", 2);
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	fFG = apollo_option("sweetbattery_fg", 0) == 1;
+ 	if (fReal) {
+ 		/* apollo (xnu 0182): what answers at the charger's and the gauge's blocks (boot 121: all zeros, "NOT read") */
+ 		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48};
+@@ -298,6 +348,24 @@
+ 			IOLog("SWEET BATTERY: SID %u block 0x%02x00: %s type %#x subtype %#x\n", sweet_battery_sid, blocks[i],
+ 			    ok ? "read," : "NOT read,", type, subtype);
+ 		}
++		/* apollo (xnu 0188): is the fg-gen4 alive? type/subtype and the revision bytes of its blocks and the ADC5 */
++		static const unsigned fgBlocks[] = {0x40, 0x41, 0x42, 0x43, 0x31};
++		for (unsigned i = 0; i < sizeof(fgBlocks) / sizeof(fgBlocks[0]); ++i) {
++			uint8_t id[6] = {0, 0, 0, 0, 0, 0};
++			unsigned bad = 0;
++			for (unsigned r = 0; r < 6; ++r) {
++				bad += sweet_spmi_read(sweet_battery_sid, fgBlocks[i] << 8 | r, &id[r]) ? 1u : 0u;
++			}
++			IOLog("SWEET BATT: SID %u block 0x%02x00: %u of 6 reads failed; revision %02x %02x %02x %02x type %#x "
++			    "subtype %#x\n", sweet_battery_sid, fgBlocks[i], bad, id[0], id[1], id[2], id[3], id[4], id[5]);
++		}
++		/* raw windows: SOC block 0x00-0x0f and 0x40-0x4f; BATT_INFO 0x00-0x0f and 0x50-0x6f (temperature, voltage, current) */
++		dumpWindow(0x4000, 0x00);
++		dumpWindow(0x4000, 0x40);
++		dumpWindow(0x4100, 0x00);
++		dumpWindow(0x4100, 0x50);
++		dumpWindow(0x4100, 0x60);
++	}
+ 	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
