@@ -1,0 +1,139 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -55,6 +55,9 @@
+ /* bsd/dev/apollo_pmic.c (xnu 0190): the USBIN peripheral's channel is ours; a write of its four ICL registers only */
+ extern "C" int apollo_pmic_usbin_ours(void);
+ extern "C" int apollo_pmic_usbin_write(unsigned reg, uint8_t value);
++/* xnu 0191: the arbiter's status of the last such write, and the tries it took */
++extern "C" unsigned apollo_pmic_usbin_status(void);
++extern "C" unsigned apollo_pmic_usbin_tries(void);
+ /* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
+ static unsigned sweet_battery_sid = 2;
+ static const unsigned kSweetDesignMAh = 5000;
+@@ -93,6 +96,7 @@
+ 	void chargeLimit(void);
+ 	void chargeRestore(const char *why);
+ 	bool chargeWrite(unsigned index, uint8_t value);
++	void chargeDump(const char *when);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -386,16 +390,44 @@
+ }
+ 
+ /* apollo (xnu 0190): write one of kChgRegs (by index), read it back, log both; true if it reads back as written */
++/*
++ * xnu 0191: the four registers apollo_chg writes and what the charger says it does with them (read only: DCDC
++ * ICL_MAX_STATUS 0x1106, ICL_STATUS 0x1107 = the limit in force, AICL_ICL_STATUS 0x1108, AICL_STATUS 0x110a, and
++ * USBIN_CMD_IL 0x1340, whose bit 0 is "input suspended"); "??" for a byte that could not be read.
++ */
++void
++SweetBattery::chargeDump(const char *when)
++{
++	static const unsigned regs[] = {0x1370, 0x1366, 0x1342, 0x1365, 0x1106, 0x1107, 0x1108, 0x110a, 0x1340};
++	char line[160];
++	unsigned at = 0;
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && at + 12 < sizeof(line); ++i) {
++		uint8_t v = 0;
++		if (sweet_spmi_read(sweet_battery_sid, regs[i], &v)) {
++			at += (unsigned)snprintf(line + at, sizeof(line) - at, " %04x=??", regs[i]);
++		} else {
++			at += (unsigned)snprintf(line + at, sizeof(line) - at, " %04x=%02x", regs[i], v);
++		}
++	}
++	IOLog("SWEET BATT: charger registers (%s):%s\n", when, line);
++}
++
++/* write one of kChgRegs (by index), read it back at once and 20 ms later, log all; true if it stays as written */
+ bool
+ SweetBattery::chargeWrite(unsigned index, uint8_t value)
+ {
+-	uint8_t back = 0;
++	uint8_t back = 0, later = 0;
+ 	fChgChanged[index] = true;
+-	bool wrote = apollo_pmic_usbin_write(kChgRegs[index], value) == 0;
++	int rc = apollo_pmic_usbin_write(kChgRegs[index], value);
++	unsigned status = apollo_pmic_usbin_status(), tries = apollo_pmic_usbin_tries();
+ 	bool read = !sweet_spmi_read(sweet_battery_sid, kChgRegs[index], &back);
+-	IOLog("SWEET BATT: wrote %#06x %#x read back %#x%s\n", kChgRegs[index], value, back,
+-	    !wrote ? " (write failed)" : (!read ? " (read back failed)" : ""));
+-	return wrote && read && back == value;
++	IOSleep(20);
++	bool read2 = !sweet_spmi_read(sweet_battery_sid, kChgRegs[index], &later);
++	IOLog("SWEET BATT: write %#06x <- %#x: %s, arbiter status %#x after %u %s; read back %#x%s, 20 ms later %#x%s\n",
++	    kChgRegs[index], value, rc == 0 ? "sent" : "NOT sent (refused before the bus)", status, tries,
++	    tries == 1 ? "try" : "tries", back, read ? "" : " (failed)", later, read2 ? "" : " (failed)");
++	chargeDump(rc == 0 ? "after the write" : "write refused");
++	return rc == 0 && read && read2 && later == value;
+ }
+ 
+ /* the values the charger had before the first write, back (the limit first, then the mode bits) */
+@@ -513,7 +545,11 @@
+ 	if (high ? (cur == want && modeOk) : cur <= want) {
+ 		return; /* already as wanted (or already lower than the USB default) */
+ 	}
++	IOLog("SWEET BATT: sequence: limit %#x -> %#x, then%s\n", cur, want,
++	    (high && !modeOk) ? " the mode registers (smblib_icl_override SW_OVERRIDE_HC_MODE), each read back" :
++	    " nothing else (the mode registers are already as smblib_icl_override wants them)");
+ 	if (!fChgActive) {
++		chargeDump("before the first write");
+ 		fChgSaved[0] = cur;
+ 		fChgSaved[1] = opt;
+ 		fChgSaved[2] = ovr;
+--- a/bsd/dev/apollo_pmic.c
++++ b/bsd/dev/apollo_pmic.c
+@@ -99,6 +99,8 @@
+ static vm_offset_t arb_core, arb_cnfg, arb_observer;
+ static uint32_t arb_channels;
+ static bool arb_tried, arb_ready;
++static uint32_t spmi_last_status;       /* the arbiter's status after the last write (xnu 0191) */
++static unsigned spmi_last_tries;
+ 
+ struct periph {
+ 	const char *name;
+@@ -231,6 +233,8 @@
+ 			status = rd(p->writes + CHANNEL_STATUS);
+ 		} while (!(status & STATUS_DONE) && mach_absolute_time() - start < limit);
+ 		lck_spin_unlock(&apollo_pmic_bus);
++		spmi_last_status = status;      /* xnu 0191: for apollo_pmic_usbin_status() */
++		spmi_last_tries = attempt + 1;
+ 		if ((status & STATUS_DONE) && !(status & STATUS_BAD)) {
+ 			return 0;
+ 		}
+@@ -264,13 +268,34 @@
+ 	return periph_find(&usbin_periph, true) ? 1 : 0;
+ }
+ 
++/*
++ * xnu 0191: `reg` is the register's whole address as SweetBattery has it (0x1342, 0x1365, 0x1366, 0x1370; the peripheral's
++ * own 8-bit offset goes on the bus). xnu 0190 compared it with the bare offsets 0x42/0x65/0x66/0x70 and so refused every
++ * write before any SPMI transfer (boot-chg1: "write failed", no arbiter status line): that, not the PMIC, was why 0x1370
++ * stayed 0xa. The arbiter's status of the last write, and how many tries it took, are kept for the log.
++ */
++unsigned apollo_pmic_usbin_status(void);
++unsigned apollo_pmic_usbin_tries(void);
++
+ int
+ apollo_pmic_usbin_write(unsigned reg, uint8_t value)
+ {
+-	if (reg != 0x42 && reg != 0x65 && reg != 0x66 && reg != 0x70) {
++	if (reg != 0x1342 && reg != 0x1365 && reg != 0x1366 && reg != 0x1370) {
+ 		return -1;
+ 	}
+-	return spmi_write1(&usbin_periph, (uint8_t)reg, value);
++	return spmi_write1(&usbin_periph, (uint8_t)(reg & 0xff), value);
++}
++
++unsigned
++apollo_pmic_usbin_status(void)
++{
++	return spmi_last_status;
++}
++
++unsigned
++apollo_pmic_usbin_tries(void)
++{
++	return spmi_last_tries;
+ }
+ 
+ /* ---- the clock (PM8150 RTC: Linux's rtc-pm8xxx.c, pm8941_regs) ---------------------------------------- */
