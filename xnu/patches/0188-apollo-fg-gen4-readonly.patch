@@ -104,9 +104,9 @@
 +	if (!valid && fReal) {
 +		/* apollo (xnu 0188): EXPERIMENTAL fg-gen4 voltage; logged, and used only with sweetbattery_fg=1 */
 +		uint16_t rawFG = 0;
-+		bool got = readWord(kFGVbatt, &rawFG) && rawFG != 0 && rawFG != 0xffff;
-+		unsigned fgmv = got ? (unsigned)(((uint64_t)rawFG * 244141u) / 1000000u) : 0;
-+		bool sane = got && fgmv >= 2800 && fgmv <= 4600;
++		bool read = readWord(kFGVbatt, &rawFG) && rawFG != 0 && rawFG != 0xffff;
++		unsigned fgmv = read ? (unsigned)(((uint64_t)rawFG * 244141u) / 1000000u) : 0;
++		bool sane = read && fgmv >= 2800 && fgmv <= 4600;
 +		if (say) {
 +			IOLog("SWEET BATT: SID %u fg-gen4 voltage (experimental) %#x -> %u mV, %s%s\n", sid, rawFG, fgmv,
 +			    sane ? "plausible" : "not plausible", fFG ? ", used" : ", not used (sweetbattery_fg=0)");
@@ -142,7 +142,7 @@
  	if (fReal) {
  		/* apollo (xnu 0182): what answers at the charger's and the gauge's blocks (boot 121: all zeros, "NOT read") */
  		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48};
-@@ -298,6 +348,24 @@
+@@ -298,6 +348,23 @@
  			IOLog("SWEET BATTERY: SID %u block 0x%02x00: %s type %#x subtype %#x\n", sweet_battery_sid, blocks[i],
  			    ok ? "read," : "NOT read,", type, subtype);
  		}
@@ -163,7 +163,6 @@
 +		dumpWindow(0x4100, 0x00);
 +		dumpWindow(0x4100, 0x50);
 +		dumpWindow(0x4100, 0x60);
-+	}
  	}
  	/* Publish a complete source BEFORE registerService wakes powerd. */
  	poll();
