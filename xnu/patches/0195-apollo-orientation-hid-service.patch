@@ -1,0 +1,307 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -621,6 +621,7 @@
+ /*
+  * (xnu 0194) Boot-arg / option sweetmotion_mask=N (default 0xf: all four, as before) leaves services out:
+  * bit 0 accel, bit 1 gyro, bit 2 prox, bit 3 ALS. To tell which of them makes backboardd crash.
++ * (xnu 0195) bit 4: SweetHIDOrientation, off by default (the 0xf default is unchanged).
+  */
+ static unsigned
+ sweet_motion_bit(UInt32 usage)
+@@ -630,6 +631,7 @@
+ 	case 9:  return 2;      /* gyro */
+ 	case 8:  return 4;      /* prox */
+ 	case 4:  return 8;      /* ALS */
++	case 0x8a: return 0x10; /* orientation (xnu 0195) */
+ 	}
+ 	return 0;
+ }
+@@ -678,7 +680,7 @@
+ 		if (lux >= 0) {
+ 			gSweetLux = lux;
+ 		}
+-		gSweetMotionMask = (unsigned)apollo_option("sweetmotion_mask", 0xf) & 0xf;
++		gSweetMotionMask = (unsigned)apollo_option("sweetmotion_mask", 0xf) & 0x1f;
+ 		gSweetMotionMode = mode < 0 ? 0 : mode;
+ 	}
+ 	return gSweetMotionMode;
+@@ -690,21 +692,43 @@
+ 	return (IOFixed)(((int64_t)milli << 16) / 1000);
+ }
+ 
++/*
++ * (xnu 0195) A motion coprocessor's events carry the sample's sensor time in a child event:
++ * CoreLocation's sensorTimeFromHidChildEvent() (locationd, backboardd) takes the first child's 8-byte
++ * payload when it is vendor-defined with page 0xff15 usage 2 ("Event has no children" / "no timestamp"
++ * otherwise, and the event is dropped as stale @ 0). Times must increase.
++ */
++static void
++sweet_add_sensor_time(IOHIDEvent *e, uint64_t ts)
++{
++	IOHIDEvent *child = IOHIDEvent::vendorDefinedEvent(ts, 0xff15, 2, 0, (UInt8 *)&ts, sizeof(ts));
++	if (child) {
++		e->appendChild(child);
++		child->release();
++	}
++}
++
+ class SweetHIDMotion : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDMotion);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual bool open(IOService *client, IOOptionBits options, void *context, Action action) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return SWEET_PAGE_APPLE_VENDOR; }
+ 	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 0; }
++	virtual IOHIDEventType sweetEventType() { return (IOHIDEventType)0; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now __unused) { return NULL; }
++	/* what a tick sends (us: the tick period, 0 for the one-shot after an open); NULL sends nothing */
++	virtual IOHIDEvent *nextEvent(uint64_t now, UInt32 us __unused) { return makeEvent(now); }
+ 	void setInterval(UInt32 us);
+ private:
+ 	static void tick(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTimer;
+ 	UInt32 fInterval;       /* us; 0: stopped */
+ 	UInt32 fSeq;
++	volatile bool fPoke;    /* one report after an open, whatever the interval */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDMotion, IOHIDEventService);
+ 
+@@ -715,9 +739,14 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
+ 	{
+-		return IOHIDEvent::accelerometerEvent(now, sweet_milli_fixed(gSweetGravity[0]),
+-		           sweet_milli_fixed(gSweetGravity[1]), sweet_milli_fixed(gSweetGravity[2]));
++		IOHIDEvent *e = IOHIDEvent::accelerometerEvent(now, sweet_milli_fixed(gSweetGravity[0]),
++		    sweet_milli_fixed(gSweetGravity[1]), sweet_milli_fixed(gSweetGravity[2]));
++		if (e) {
++			sweet_add_sensor_time(e, now);
++		}
++		return e;
+ 	}
++	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeAccelerometer; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDAccel, SweetHIDMotion);
+ 
+@@ -728,8 +757,13 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 9; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
+ 	{
+-		return IOHIDEvent::gyroEvent(now, 0, 0, 0);
++		IOHIDEvent *e = IOHIDEvent::gyroEvent(now, 0, 0, 0);
++		if (e) {
++			sweet_add_sensor_time(e, now);
++		}
++		return e;
+ 	}
++	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeGyro; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDGyro, SweetHIDMotion);
+ 
+@@ -740,8 +774,13 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 8; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
+ 	{
+-		return IOHIDEvent::proximityEvent(now, (IOHIDProximityDetectionMask)0, 0);   /* far */
++		IOHIDEvent *e = IOHIDEvent::proximityEvent(now, (IOHIDProximityDetectionMask)0, 0);   /* far */
++		if (e) {
++			sweet_add_sensor_time(e, now);
++		}
++		return e;
+ 	}
++	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeProximity; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDProx, SweetHIDMotion);
+ 
+@@ -752,11 +791,113 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
+ 	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE
+ 	{
+-		return IOHIDEvent::ambientLightSensorEvent(now, (UInt32)gSweetLux);
++		IOHIDEvent *e = IOHIDEvent::ambientLightSensorEvent(now, (UInt32)gSweetLux);
++		if (e) {
++			sweet_add_sensor_time(e, now);
++		}
++		return e;
+ 	}
++	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeAmbientLightSensor; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDALS, SweetHIDMotion);
+ 
++/*
++ * (xnu 0195) SweetHIDOrientation: the device orientation the way a motion coprocessor reports it. Raw
++ * accel/gyro alone never rotated the screen (locationd's own detector wants more; backboardd's HID system
++ * takes ready-made orientations, hidSystem:receivedUpdatedDeviceOrientation:). A Device Orientation
++ * collection (Sensor page 0x20, usage 0x8A) whose events are kIOHIDEventTypeOrientation of type CMUsage
++ * carrying an AppleVendorMotion (0xff0c) usage: 0x64 ambiguous, 0x65 portrait, 0x66 upside down,
++ * 0x67 landscape left, 0x68 landscape right, 0x69 face up, 0x6a face down, each with the sensor-time child
++ * event. The orientation comes from the gravity vector the accelerometer reports (milli-g): the axis that
++ * leads the others by 200 decides: x < 0 landscape left, x > 0 landscape right, y < 0 portrait, y > 0
++ * upside down, z < 0 face up, z > 0 face down; otherwise ambiguous. Needs bit 4 of sweetmotion_mask
++ * (e.g. 0x13 = accel + gyro + orientation).
++ */
++enum {
++	kSweetOrientAmbiguous = 0x64, kSweetOrientPortrait, kSweetOrientUpsideDown, kSweetOrientLandscapeLeft,
++	kSweetOrientLandscapeRight, kSweetOrientFaceUp, kSweetOrientFaceDown,
++};
++
++static UInt32
++sweet_orientation_of(int x, int y, int z)
++{
++	int ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
++	if (ax > ay + 200 && ax > az + 200) {
++		return x < 0 ? kSweetOrientLandscapeLeft : kSweetOrientLandscapeRight;
++	}
++	if (ay > ax + 200 && ay > az + 200) {
++		return y < 0 ? kSweetOrientPortrait : kSweetOrientUpsideDown;
++	}
++	if (az > ax + 200 && az > ay + 200) {
++		return z < 0 ? kSweetOrientFaceUp : kSweetOrientFaceDown;
++	}
++	return kSweetOrientAmbiguous;
++}
++
++#define SWEET_ORIENT_RESEND_US 1000000
++#define SWEET_ORIENT_LOG_US    10000000
++
++class SweetHIDOrientation : public SweetHIDMotion {
++	OSDeclareDefaultStructors(SweetHIDOrientation);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0x20; }       /* kHIDPage_Sensor */
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 0x8a; }           /* Orientation: Device Orientation */
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 5; }
++	virtual IOHIDEventType sweetEventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeOrientation; }
++	virtual IOHIDEvent *makeEvent(uint64_t now) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *nextEvent(uint64_t now, UInt32 us) APPLE_KEXT_OVERRIDE;
++private:
++	UInt32 fUsage;          /* derived orientation of the last event */
++	uint64_t fLastTs;       /* sensor times must increase */
++	UInt32 fSinceSendUs;    /* time since the last event of a tick */
++	UInt32 fSinceLogUs;
++	UInt32 fSent;
++	bool fSentAny;
++};
++OSDefineMetaClassAndStructors(SweetHIDOrientation, SweetHIDMotion);
++
++IOHIDEvent *
++SweetHIDOrientation::makeEvent(uint64_t now)
++{
++	if (now <= fLastTs) {
++		now = fLastTs + 1;
++	}
++	fLastTs = now;
++	fUsage = sweet_orientation_of(gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
++	IOHIDEvent *e = IOHIDEvent::orientationEvent(now, kIOHIDOrientationTypeCMUsage);
++	if (e) {
++		e->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage, (SInt32)fUsage);
++		sweet_add_sensor_time(e, now);
++		fSent++;
++	}
++	return e;
++}
++
++IOHIDEvent *
++SweetHIDOrientation::nextEvent(uint64_t now, UInt32 us)
++{
++	UInt32 usage = sweet_orientation_of(gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
++	bool changed = !fSentAny || usage != fUsage;
++
++	fSinceSendUs += us;
++	fSinceLogUs += us;
++	if (fSinceLogUs >= SWEET_ORIENT_LOG_US) {
++		fSinceLogUs = 0;
++		IOLog("SWEET HID: SweetHIDOrientation orientation 0x%x, %u events sent, %u clients\n", (unsigned)usage,
++		    (unsigned)fSent, _clients ? (unsigned)_clients->getCount() : 0);
++	}
++	/* the first event, a change, an open (us == 0) and then every second */
++	if (!changed && us != 0 && fSinceSendUs < SWEET_ORIENT_RESEND_US) {
++		return NULL;
++	}
++	if (changed && fSentAny) {
++		IOLog("SWEET HID: SweetHIDOrientation orientation now 0x%x\n", (unsigned)usage);
++	}
++	fSentAny = true;
++	fSinceSendUs = 0;
++	return makeEvent(now);
++}
++
+ bool
+ SweetHIDMotion::start(IOService *provider)
+ {
+@@ -777,6 +918,10 @@
+ 		OSSafeReleaseNULL(fTimer);
+ 		return false;
+ 	}
++	/* backboardd's proximity wrapper reads Placement (not 1: "ignoring discrete prox service", then a nil
++	 * where it wants a UI mode: -[NSNull applyUIMode:]); CoreMotion looks at NeedsHostState */
++	setProperty("Placement", (unsigned long long)1, 32);
++	setProperty("NeedsHostState", kOSBooleanFalse);
+ 	registerService();
+ 	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, mask 0x%x, gravity %d,%d,%d mg)\n", getName(),
+ 	    (unsigned)getPrimaryUsage(), mode, gSweetMotionMask, gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
+@@ -786,6 +931,25 @@
+ 	return true;
+ }
+ 
++bool
++SweetHIDMotion::open(IOService *client, IOOptionBits options, void *context, Action action)
++{
++	bool ok = IOHIDEventService::open(client, options, context, action);
++
++	if (ok && fTimer) {
++		/* a client that has just opened gets the current value at once, whatever the interval */
++		fPoke = true;
++		fTimer->setTimeoutMS(100);
++	}
++	return ok;
++}
++
++IOHIDEvent *
++SweetHIDMotion::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	return type == sweetEventType() ? makeEvent(mach_absolute_time()) : NULL;
++}
++
+ void
+ SweetHIDMotion::setInterval(UInt32 us)
+ {
+@@ -822,14 +986,18 @@
+ 	SweetHIDMotion *self = (SweetHIDMotion *)owner;
+ 	UInt32 us = self->fInterval;
+ 
+-	if (us == 0) {
++	if (us == 0 && !self->fPoke) {
+ 		return;
+ 	}
+-	IOHIDEvent *event = self->makeEvent(mach_absolute_time());
++	bool poke = self->fPoke;
++	self->fPoke = false;
++	IOHIDEvent *event = self->nextEvent(mach_absolute_time(), poke ? 0 : us);
+ 	if (event) {
+ 		self->dispatchEvent(event);
+ 		event->release();
+ 	}
+ 	self->fSeq++;
+-	sender->setTimeoutUS(us);
++	if (us != 0) {
++		sender->setTimeoutUS(us);
++	}
+ }
+\ No newline at end of file
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -28,6 +28,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDALS;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDOrientation;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDOrientation;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
