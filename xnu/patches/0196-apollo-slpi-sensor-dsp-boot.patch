@@ -183,7 +183,7 @@
 +static LCK_GRP_DECLARE(adsp_lock_group, "apollo-slpi");
 +/* sweet_adsp.c's (xnu 0196): the one mailbox to the always-on processor, the one SMEM lock, the one start/stop lock, the log's line lock */
 +extern lck_mtx_t apollo_aop_mailbox_lock, apollo_smem_alloc_lock, apollo_dsp_hw_lock, apollo_say_lock;
-+extern volatile bool apollo_slpi_running;
++extern volatile bool apollo_adsp_running;
 +#define dsp_lock apollo_dsp_hw_lock
 +#define say_lock apollo_say_lock
 +
@@ -2902,7 +2902,7 @@
 +		sleep_ms(200);
 +	}
 +	sleep_ms(3000);                 /* (the boot's own files, xnu 0120, are written right after the root is mounted) */
-+	for (unsigned waited = 0; waited < 90 && apollo_slpi_running; waited++) {
++	for (unsigned waited = 0; waited < 90 && apollo_adsp_running; waited++) {
 +		if (waited == 0) {
 +			printf("SWEET SLPI: waiting for the SLPI's bring-up (sweet_adsp.c) to be over, 90 s at most\n");
 +		}
