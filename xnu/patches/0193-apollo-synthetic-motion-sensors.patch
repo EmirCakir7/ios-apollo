@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -590,3 +590,223 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -590,3 +590,221 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -167,8 +167,7 @@
 +		return false;
 +	}
 +	registerService();
-+	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, gravity %d,%d,%d mg)
-+", getName(),
++	IOLog("SWEET HID: %s registered (usage 0x%x, mode %d, gravity %d,%d,%d mg)\n", getName(),
 +	    (unsigned)getPrimaryUsage(), mode, gSweetGravity[0], gSweetGravity[1], gSweetGravity[2]);
 +	if (mode >= 2) {
 +		setInterval(1000000);
@@ -199,8 +198,7 @@
 +
 +	if (interval && fTimer && sweet_motion_mode() == 1) {
 +		UInt32 us = interval->unsigned32BitValue();
-+		IOLog("SWEET HID: %s ReportInterval %u us
-+", getName(), (unsigned)us);
++		IOLog("SWEET HID: %s ReportInterval %u us\n", getName(), (unsigned)us);
 +		setInterval(us);
 +		setProperty(kIOHIDReportIntervalKey, (unsigned long long)us, 32);
 +	}
