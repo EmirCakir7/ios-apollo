@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index f1415bb..837f77c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -38,6 +38,16 @@
+  * apollo_chg_notemp=1; they stop, and the previous values are written back, when the charger reports the battery hot
+  * (BATTERY_CHARGER_STATUS_7: HOT_SOFT, TOO_HOT or TOO_HOT_AFP), or the charger is unplugged. After a hot report the
+  * limit stays off until the next boot.
++ *
++ * apollo (xnu 0200): sweetbattery_health=1 publishes what powerd's Battery Health code reads (strings and disassembly of
++ * powerd.bundle/powerd of the root image: it takes the source's registry properties, wants "Serial", then
++ * "NominalChargeCapacity" and "DesignCapacity" (both integers) to make "Maximum Capacity Percent" = NCC * 100 / design
++ * (valid 1..150), and reads "CycleCount"; the same keys are also looked up under "BatteryData"). Without them
++ * Settings > Battery > Battery Health spins for ever. The source also reports like a real iPhone's: MaxCapacity 100,
++ * CurrentCapacity in percent (the mAh stay in AppleRaw*). NOT measured: the serial is a placeholder (the battery's own
++ * is not readable here), the learned capacity sits in the fg-gen4's SRAM behind the MEM_IF, so NominalChargeCapacity is
++ * the 5036 mAh the Android kernel's charge_full reported for this very battery; the cycle count stays what it was (0;
++ * the gauge says 0, which is unreliable): nothing is made up beyond that.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -61,6 +71,10 @@ extern "C" unsigned apollo_pmic_usbin_tries(void);
+ /* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
+ static unsigned sweet_battery_sid = 2;
+ static const unsigned kSweetDesignMAh = 5000;
++/* xnu 0200: the full-charge capacity Android's charge_full showed for this battery (mAh); the gauge's own is unreadable here */
++static const unsigned kSweetNominalMAh = 5036;
++/* xnu 0200: a placeholder, 17 characters like an Apple battery serial; the real one is not readable here */
++static const char kSweetBatterySerial[] = "SWEETAPOLLO000001";
+ /* EXPERIMENTAL, log only, never used: fg-gen4 BATT_INFO_VBATT_LSB/MSB (fg-reg.h: batt_info_base + 0xa0), 122.07 uV/step */
+ static const unsigned kFGVbatt = 0x41a0;
+ /* fg-gen4 BATT_SOC_FG_MONOTONIC_SOC and its copy (fg-reg.h: batt_soc_base + 0x09, 0x0a), 0..255 */
+@@ -84,7 +98,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal, fFG;
++	bool fTimerAdded, fRunning, fReal, fFG, fHealth, fHealthSaid;
+ 	int fLastMode;
+ 	unsigned fPolls;
+ 	unsigned fLastSoc;
+@@ -99,6 +113,8 @@ private:
+ 	void chargeDump(const char *when);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
++	void putString(const char *key, const char *value);
++	void putHealth(unsigned percent, unsigned capacity);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
+@@ -121,7 +137,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = fFG = false;
++	fTimerAdded = fRunning = fReal = fFG = fHealth = fHealthSaid = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -176,6 +192,52 @@ SweetBattery::putBool(const char *key, bool value)
+ 	}
+ }
+ 
++void
++SweetBattery::putString(const char *key, const char *value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSString *string = OSString::withCString(value);
++	if (symbol && string) {
++		setPSProperty(symbol, string);
++	}
++	OSSafeReleaseNULL(string);
++	OSSafeReleaseNULL(symbol);
++}
++
++/* xnu 0200: the properties powerd's Battery Health code reads, at the top and in "BatteryData" (see the header) */
++void
++SweetBattery::putHealth(unsigned percent, unsigned capacity)
++{
++	putString("Serial", kSweetBatterySerial);
++	putString("BatterySerialNumber", kSweetBatterySerial);
++	putNumber("NominalChargeCapacity", kSweetNominalMAh);
++	OSDictionary *data = OSDictionary::withCapacity(5);
++	if (data) {
++		const char *keys[] = {"CycleCount", "NominalChargeCapacity", "AppleRawMaxCapacity", "DesignCapacity", "AppleRawCurrentCapacity"};
++		UInt32 values[] = {0, kSweetNominalMAh, kSweetNominalMAh, kSweetDesignMAh, capacity};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				data->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		const OSSymbol *symbol = OSSymbol::withCString("BatteryData");
++		if (symbol) {
++			setPSProperty(symbol, data);
++			symbol->release();
++		}
++		data->release();
++	}
++	if (!fHealthSaid) {
++		fHealthSaid = true;
++		IOLog("SWEET BATT: health published: Serial \"%s\" (placeholder), DesignCapacity %u, NominalChargeCapacity %u mAh "
++		    "(Android's charge_full, not read from the gauge: %u%% of the design), CycleCount 0 (as before: the gauge's 0 "
++		    "is unreliable), MaxCapacity 100, CurrentCapacity %u%%\n", kSweetBatterySerial, kSweetDesignMAh,
++		    kSweetNominalMAh, (kSweetNominalMAh * 100u + kSweetDesignMAh - 1u) / kSweetDesignMAh, percent);
++	}
++}
++
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+@@ -183,8 +245,9 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	/* Use consistent mAh units. powerd computes C*100/M. */
+ 	const unsigned capacity = (kSweetDesignMAh * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+-	setCurrentCapacity(capacity);
+-	setMaxCapacity(kSweetDesignMAh);
++	/* xnu 0200: sweetbattery_health=1 reports like a real iPhone: percent of 100 (the mAh are in AppleRaw*) */
++	setCurrentCapacity(fHealth ? percent : capacity);
++	setMaxCapacity(fHealth ? 100u : kSweetDesignMAh);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -198,8 +261,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", kSweetDesignMAh);
++	putNumber("AppleRawMaxCapacity", fHealth ? kSweetNominalMAh : kSweetDesignMAh);
+ 	putNumber("DesignCapacity", kSweetDesignMAh);
++	if (fHealth) {
++		putHealth(percent, capacity);
++	}
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -599,6 +665,7 @@ SweetBattery::start(IOService *provider)
+ 	sweet_battery_sid = (unsigned)apollo_option("sweetbattery_sid", 2);
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	fFG = apollo_option("sweetbattery_fg", 0) == 1;
++	fHealth = apollo_option("sweetbattery_health", 0) == 1; /* xnu 0200 */
+ 	/* apollo (xnu 0190): the input current limit, default off; 100 mA units, at most 3.0 A whatever is asked */
+ 	int chg = apollo_option("apollo_chg", 0);
+ 	fChgUnits = chg <= 0 ? 0u : ((unsigned)chg > kChgMaxUnits ? kChgMaxUnits : (unsigned)chg);
