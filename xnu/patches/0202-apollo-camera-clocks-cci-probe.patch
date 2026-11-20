@@ -24,7 +24,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,398 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 2 of the bring-up: the clock and bus blocks only.
 + *
@@ -58,6 +58,7 @@
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t thread_terminate(thread_t thread);
 +extern void loader_log_putc(char c);
++extern int apollo_option(const char *name, int fallback);
 +extern lck_mtx_t apollo_say_lock;       /* sweet_adsp.c's: the log's line lock */
 +
 +#define GCC_PA          0x00100000u
@@ -263,7 +264,11 @@
 +			rcg_restore(camcc, u->offset - 4);
 +		}
 +	}
-+	if (gdsc_changed) {
++	if (gdsc_changed && apollo_option("apollo_cam_collapse", 0) == 0) {
++		/* collapsing it again raised an SError (cam6 run, 2026-11-21: steps 1-6 fine, the CCI alive at 0x10070000): left on unless apollo_cam_collapse=1; a reboot resets it */
++		 say("SWEET CAM: titan_top GDSC left ON (apollo_cam_collapse=1 would collapse it again, which panicked)\n");
++		 gdsc_changed = false;
++	} else if (gdsc_changed) {
 +		/* the GDSC's own bit last: the branches that needed its power are off by now */
 +		wr(camcc + CC_TITAN_TOP_GDSCR, rd(camcc + CC_TITAN_TOP_GDSCR) | GDSC_SW_COLLAPSE);
 +		poll(camcc + CC_TITAN_TOP_GDSCR, GDSC_PWR_ON, 0, 500, &value);
