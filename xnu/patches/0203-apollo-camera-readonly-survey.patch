@@ -17,7 +17,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_camro.c
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,456 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 3 of the bring-up: a READ-ONLY survey of the power and pin state.
 + *
@@ -273,6 +273,8 @@
 +		uint32_t cfg[3] = { 0, 0, 0 }, io[3] = { 0, 0, 0 };
 +		int pick = -1;
 +
++		say("SWEET CAM: tlmm: about to read gpio%u in the %s tile\n", pin_gpio[p], tile_name[pin_tile[p]]);
++		delay_for_interval(11, NSEC_PER_SEC);   /* if the next read hangs, this is the last line in the log */
 +		for (t = 0; t < 3; t++) {
 +			if (tile[t] == 0 || t != pin_tile[p]) {
 +				continue;
