@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--native-display | --display-height N] [--artwork-subtype N] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
             [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw DIR|amss.bin] [--wifi-board FILE] [--wifi-mac aa:bb:cc:dd:ee:ff]
-            [--bt-fw DIR]
+            [--bt-fw DIR] [--slpi-fw DIR]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --native-display: /arm-io/disp0's canvas is the panel's own 1080x2400 instead of the iPhone X's
 1125x2436, for boot-arg sweetfb_native=1 (iOS lays out for 360x800 points @3x; the picture 1:1 on
@@ -23,6 +23,8 @@ matches (a folder: its entries) into the kernel log; in those two a component ma
 or folder on the root, unless something is at TO already (xnu 0140; after the removals, before the
 files). tools/wallpaper-files.py writes such lists; tools/root-files/ has settings. Only
 FILE_PREFIXES paths; 64 files and 48 MiB at most.
+--slpi-fw DIR (xnu 0196): DIR's slpi.mdt and slpi.bNN (tools/pull-slpi-fw.sh, research/apollo-slpi/, not in git) onto the
+root as /usr/local/fw/slpi.* for sweet_slpi.c (boot-arg or --option apollo_slpi=1); counted in the same 64 files and 48 MiB.
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -130,9 +132,28 @@ def node(name, props=(), children=()):
     return n
 
 
+def d22ap_aop_sensors(path=D22AP_ADT, names=('accel', 'gyro', 'compass', 'prox', 'pressure')):
+    """The sensor nodes of /arm-io/aop/iop-aop-nub of the real D22AP tree (accel, gyro, compass, prox,
+    pressure: device_type, device-usage-page, device-usage), without the syscfg calibration placeholders
+    iBoot would fill in (flag bit set) and the node bookkeeping: [(name, props)]. Empty without the tree."""
+    if not os.path.exists(path):
+        print(f'warning: {path} missing, no sensor nodes', file=sys.stderr)
+        return []
+    nm = lambda n: dict((k, v) for k, f, v in n.props).get('name')
+    root, _ = adt.parse(open(path, 'rb').read())
+    try:
+        nub = root
+        for part in ('arm-io', 'aop', 'iop-aop-nub'):
+            nub = next(c for c in nub.children if nm(c) == cstr(part))
+    except StopIteration:
+        raise SystemExit(f'{path}: no /arm-io/aop/iop-aop-nub node')
+    return [(nm(c)[:-1].decode(), [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')])
+            for c in nub.children if nm(c)[:-1].decode() in names]
+
+
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
           deletes=(), lists=(), wifi=(), macs=(), bt=(), moves=(), native_display=False, display_height=None,
-          artwork_subtype=None, options=()):
+          artwork_subtype=None, options=(), sensors=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -258,7 +279,13 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
             ph(),
             ('device_type', cstr('wlan')),
             ('compatible', cstr('apollo,qca6390')),
-        ])] if wifi else []))
+        ])] if wifi else []) +
+        # --sensors: /arm-io/aop/iop-aop-nub/{accel,gyro,compass,prox,pressure} as the iPhone X has them (device-usage-page
+        # 0xff00 and device-usage 3/9/0xa/8; pressure: page 0x14), for MobileGestalt's sensor answers and
+        # CoreMotion/sensord; the kernel's synthetic services (xnu 0193, sweetmotion=1) are what answers on them
+        ([node('aop', [ph(), ('device_type', cstr('aop'))],
+               [node('iop-aop-nub', [ph()],
+                     [node(name, [ph()] + props) for name, props in d22ap_aop_sensors()])])] if sensors else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -510,6 +537,21 @@ if __name__ == '__main__':
         files.append((dest, open(local, 'rb').read(), owner))
         print(f'file for the root: {dest} ({len(files[-1][1])} bytes' +
               (f', {owner[0]}:{owner[1]} {owner[2]:o})' if owner else ')'), file=sys.stderr)
+    if '--slpi-fw' in sys.argv:
+        # the sensor DSP's firmware (xnu 0196, sweet_slpi.c), as tools/pull-slpi-fw.sh's list would carry it: the files go onto the
+        # root as /usr/local/fw/slpi.mdt and slpi.bNN, like the audio DSP's (--files-from research/apollo-audio/files-adsp.txt)
+        where = sys.argv[sys.argv.index('--slpi-fw') + 1]
+        if not os.path.isdir(where):
+            sys.exit(f'--slpi-fw {where}: not a folder. tools/pull-slpi-fw.sh puts the firmware into research/apollo-slpi/')
+        names = sorted(n for n in os.listdir(where) if re.fullmatch(r'slpi\.(mdt|b\d\d)', n))
+        if 'slpi.mdt' not in names or len(names) < 4:
+            sys.exit(f'--slpi-fw {where}: no slpi.mdt with its slpi.bNN segments (tools/pull-slpi-fw.sh)')
+        slpi_bytes = 0
+        for n in names:
+            data = open(os.path.join(where, n), 'rb').read()
+            slpi_bytes += len(data)
+            files.append(('/usr/local/fw/' + n, data, (0, 0, 0o644)))
+        print(f'SLPI firmware: {len(names)} files, {slpi_bytes} bytes (for the root: one boot is enough)', file=sys.stderr)
     if len(files) > 64 or len(deletes) > 64 or len(lists) > 64 or len(moves) > 64:
         sys.exit(f'--file/--files-from: {len(files)} files, {len(deletes)} removals, {len(lists)} lists, {len(moves)} moves: '
                  '64 of each at most')
@@ -522,7 +564,7 @@ if __name__ == '__main__':
                  gpu_extra=gpu_extra, p3='--p3' in sys.argv, native_display='--native-display' in sys.argv,
                  display_height=int(sys.argv[sys.argv.index('--display-height') + 1]) if '--display-height' in sys.argv else None,
                  artwork_subtype=int(sys.argv[sys.argv.index('--artwork-subtype') + 1]) if '--artwork-subtype' in sys.argv else None,
-                 options=options,
+                 options=options, sensors='--sensors' in sys.argv,
                  files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt,
                  moves=moves)
     blob = adt.serialize(root)
