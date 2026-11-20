@@ -24,7 +24,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,392 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 2 of the bring-up: the clock and bus blocks only.
 + *
@@ -389,6 +389,7 @@
 +	thread_terminate(current_thread());
 +}
 +
++extern int apollo_option(const char *name, int fallback);     /* bsd/dev/apollo_pmic.c (xnu 0181): a boot-arg, else the ADT /sweet-options */
 +void
 +apollo_cam_init(void);
 +
@@ -398,11 +399,11 @@
 +	uint32_t on = 0;
 +	thread_t thread;
 +
-+	if (!PE_parse_boot_argn("apollo_cam", &on, sizeof(on)) || on == 0) {
++	if ((on = (uint32_t)apollo_option("apollo_cam", 0)) == 0) {
 +		return;
 +	}
-+	PE_parse_boot_argn("apollo_cam_delay", &delay_seconds, sizeof(delay_seconds));
-+	PE_parse_boot_argn("apollo_cam_step", &last_step, sizeof(last_step));
++	delay_seconds = (uint32_t)apollo_option("apollo_cam_delay", (int)delay_seconds);
++	last_step = (uint32_t)apollo_option("apollo_cam_step", (int)last_step);
 +	if (delay_seconds > 600) {
 +		delay_seconds = 600;
 +	}
