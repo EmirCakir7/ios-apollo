@@ -1,0 +1,418 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -140,5 +140,6 @@
+ bsd/dev/sweet_display.c			standard
+ bsd/dev/sweet_slpi.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,5 +59,6 @@
+ extern void apollo_adsp_init(void);
+ extern void apollo_slpi_init(void);
++extern void apollo_cam_init(void);
+ extern void apollo_haptic_init(void);
+ extern void sweet_rpmh_ddr_top(void);
+ extern void apollo_backlight_init(void);
+@@ -683,3 +684,5 @@
+ 	/* the sensor DSP (xnu 0196, sweet_slpi.c): nothing without boot-arg apollo_slpi=1 (it waits for apollo_audio's start to be over) */
+ 	apollo_slpi_init();
++	/* the camera clocks and the CCI (xnu 0202, sweet_cam.c): nothing without boot-arg apollo_cam=1; never powers the sensor */
++	apollo_cam_init();
+ 	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
+--- /dev/null
++++ b/bsd/dev/sweet_cam.c
+@@ -0,0 +1,391 @@
++/*
++ * apollo (Xiaomi Mi 10T / SM8250): camera, step 2 of the bring-up: the clock and bus blocks only.
++ *
++ * Does NOTHING without boot-arg apollo_cam=1.  With it, after apollo_cam_delay seconds (default 40, so the system is up first),
++ * on a thread of its own:
++ *
++ *   1  GCC: gcc_camera_ahb_clk (0xb008) and gcc_camera_xo_clk (0xb040) on
++ *   2  camcc (0xad00000): slow AHB source (0x7058) set to TCXO 19.2 MHz
++ *   3  camcc: gdsc_clk (0xc16c) on, titan_top GDSC (0xc144) switched on, cpas_ahb (0xc0f4), core_ahb (0xc150) on
++ *   4  camcc: MCLK0 (source 0x5000, branch 0x5018) from TCXO at 19.2 MHz, no divider
++ *   5  camcc: CCI source (0xc0bc) from TCXO 19.2 MHz, cci_0 branch (0xc0d4) on
++ *   6  CCI master 0 (0xac4f000): read HW_VERSION, reset the block, read the status registers, clear them
++ *   7  everything above undone in reverse, to the value each register had before
++ *
++ * Not touched, ever, by this file: any I2C slave (sensor, EEPROM, actuator, pm8008, PMIC), the TLMM (gpio93/94/101/102 stay what they
++ * are, so no clock reaches any pin), the PM8150L GPIOs, the RPMh camera rails, the flash or the OIS.  Nothing here powers the sensor.
++ *
++ * apollo_cam_step=N stops after step N (then undoes); apollo_cam_delay=S.  Every line starts "SWEET CAM:" and goes to the loader's log
++ * BEFORE the step it announces, so a hang shows where it was.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++extern lck_mtx_t apollo_say_lock;       /* sweet_adsp.c's: the log's line lock */
++
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x00010000u
++#define CAMCC_PA        0x0ad00000u
++#define CAMCC_SIZE      0x00010000u
++#define CCI_PA          0x0ac4f000u
++#define CCI_SIZE        0x00001000u
++
++#define GCC_CAMERA_AHB          0xb008u
++#define GCC_CAMERA_XO           0xb040u
++
++#define CC_MCLK0_RCG            0x5000u
++#define CC_MCLK0_BRANCH         0x5018u
++#define CC_SLOW_AHB_RCG         0x7058u
++#define CC_CCI0_RCG             0xc0bcu
++#define CC_CCI0_BRANCH          0xc0d4u
++#define CC_CPAS_AHB             0xc0f4u
++#define CC_TITAN_TOP_GDSCR      0xc144u
++#define CC_CORE_AHB             0xc150u
++#define CC_GDSC_CLK             0xc16cu
++
++#define BRANCH_ENABLE           (1u << 0)
++#define BRANCH_OFF              (1u << 31)      /* halted */
++#define RCG_UPDATE              (1u << 0)
++#define RCG_ROOT_OFF            (1u << 31)
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_PWR_ON             (1u << 31)
++
++#define CCI_HW_VERSION          0x00u
++#define CCI_RESET_CMD           0x04u
++#define CCI_QUEUE_START         0x08u
++#define CCI_HALT_REQ            0x34u
++#define CCI_M0_SCL_CTL          0x100u
++#define CCI_RD_BUF_LEVEL        0x11cu
++#define CCI_Q0_CUR_WORD_CNT     0x304u
++#define CCI_IRQ_GLOBAL_CLEAR    0xc00u
++#define CCI_IRQ_MASK_0          0xc04u
++#define CCI_IRQ_CLEAR_0         0xc08u
++#define CCI_IRQ_STATUS_0        0xc0cu
++#define CCI_IRQ_MASK_1          0xc10u
++#define CCI_IRQ_CLEAR_1         0xc14u
++#define CCI_IRQ_STATUS_1        0xc18u
++#define CCI_RESET_RMSK          0x0f73f3f7u
++#define CCI_RST_DONE            (1u << 24)
++
++static uint32_t delay_seconds = 40, last_step = 7;
++
++static void
++say_line(const char *line)
++{
++	lck_mtx_lock(&apollo_say_lock);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	lck_mtx_unlock(&apollo_say_lock);
++}
++
++static void say(const char *format, ...) __printflike(1, 2);
++
++static void
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	say_line(line);
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t nanoseconds;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
++	return nanoseconds / 1000;
++}
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]\n dsb sy" : : "r" (value), "r" (address) : "memory");
++}
++
++static vm_offset_t gcc, camcc, cci;
++
++/* ---- the undo list: each register that was changed, with what it held before -------------------------- */
++struct undo {
++	vm_offset_t base;
++	uint32_t offset, original, mask;
++};
++static struct undo undo_list[24];
++static unsigned undo_count;
++static uint32_t gdsc_original;
++static bool gdsc_changed;
++
++/* Write (value & mask) into the register, remembering what was there. */
++static void
++change(vm_offset_t base, uint32_t offset, uint32_t value, uint32_t mask)
++{
++	uint32_t before = rd(base + offset);
++
++	if (undo_count < sizeof(undo_list) / sizeof(undo_list[0])) {
++		undo_list[undo_count].base = base;
++		undo_list[undo_count].offset = offset;
++		undo_list[undo_count].original = before;
++		undo_list[undo_count].mask = mask;
++		undo_count++;
++	}
++	wr(base + offset, (before & ~mask) | (value & mask));
++}
++
++/* Wait until (register & mask) == wanted; microseconds; returns the last value read. */
++static bool
++poll(vm_offset_t address, uint32_t mask, uint32_t wanted, uint32_t us, uint32_t *last)
++{
++	uint64_t end = now_us() + us;
++	uint32_t value;
++
++	for (;;) {
++		value = rd(address);
++		if ((value & mask) == wanted) {
++			*last = value;
++			return true;
++		}
++		if (now_us() > end) {
++			*last = value;
++			return false;
++		}
++		sleep_us(2);
++	}
++}
++
++static void
++branch_on(vm_offset_t base, const char *name, uint32_t offset)
++{
++	uint32_t value;
++	bool ok;
++
++	say("SWEET CAM: %s (%#x): before %#x, enabling\n", name, offset, rd(base + offset));
++	change(base, offset, BRANCH_ENABLE, BRANCH_ENABLE);
++	ok = poll(base + offset, BRANCH_OFF, 0, 1000, &value);
++	say("SWEET CAM: %s: now %#x (%s)\n", name, value, ok ? "running" : "STILL HALTED after 1 ms");
++}
++
++/* A root clock generator to the TCXO (source 0, no divider): CFG at +4, then UPDATE in CMD at +0. */
++static void
++rcg_tcxo(vm_offset_t base, const char *name, uint32_t cmd)
++{
++	uint32_t value;
++	bool ok;
++
++	say("SWEET CAM: %s (%#x): CMD %#x CFG %#x M/N/D %#x/%#x/%#x, to TCXO 19.2 MHz\n", name, cmd, rd(base + cmd), rd(base + cmd + 4),
++	    rd(base + cmd + 8), rd(base + cmd + 12), rd(base + cmd + 16));
++	change(base, cmd + 4, 0, 0xffffffffu);
++	/* the update bit itself is not restored: the CFG written back by the undo is followed by its own update */
++	wr(base + cmd, rd(base + cmd) | RCG_UPDATE);
++	ok = poll(base + cmd, RCG_UPDATE, 0, 500, &value);
++	say("SWEET CAM: %s: CMD %#x CFG %#x (%s)\n", name, value, rd(base + cmd + 4), ok ? "updated" : "UPDATE bit stuck after 500 us");
++}
++
++static void
++rcg_restore(vm_offset_t base, uint32_t cmd)
++{
++	uint32_t value;
++
++	wr(base + cmd, rd(base + cmd) | RCG_UPDATE);
++	poll(base + cmd, RCG_UPDATE, 0, 500, &value);
++}
++
++static void
++undo_all(void)
++{
++	uint32_t value;
++
++	say("SWEET CAM: undoing %u register changes, last first\n", undo_count);
++	while (undo_count > 0) {
++		struct undo *u = &undo_list[--undo_count];
++		uint32_t now = rd(u->base + u->offset);
++
++		wr(u->base + u->offset, (now & ~u->mask) | (u->original & u->mask));
++		if (u->base == camcc && (u->offset == CC_MCLK0_RCG + 4 || u->offset == CC_SLOW_AHB_RCG + 4 || u->offset == CC_CCI0_RCG + 4)) {
++			rcg_restore(camcc, u->offset - 4);
++		}
++	}
++	if (gdsc_changed) {
++		/* the GDSC's own bit last: the branches that needed its power are off by now */
++		wr(camcc + CC_TITAN_TOP_GDSCR, rd(camcc + CC_TITAN_TOP_GDSCR) | GDSC_SW_COLLAPSE);
++		poll(camcc + CC_TITAN_TOP_GDSCR, GDSC_PWR_ON, 0, 500, &value);
++		say("SWEET CAM: titan_top GDSC collapsed again: %#x (was %#x at the start)\n", value, gdsc_original);
++		gdsc_changed = false;
++	}
++}
++
++static void
++cam_steps(void)
++{
++	uint32_t value, version, s0, s1;
++	bool ok;
++
++	say("SWEET CAM: starting, up to step %u (apollo_cam_step); nothing here powers the sensor and no I2C slave is addressed\n", last_step);
++	gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	camcc = ml_io_map(CAMCC_PA, CAMCC_SIZE);
++	cci = ml_io_map(CCI_PA, CCI_SIZE);
++	if (gcc == 0 || camcc == 0 || cci == 0) {
++		say("SWEET CAM: FAILED to map the registers (gcc %lx camcc %lx cci %lx); nothing done\n", (unsigned long)gcc, (unsigned long)camcc,
++		    (unsigned long)cci);
++		return;
++	}
++
++	/* 1 */
++	say("SWEET CAM: step 1: GCC camera clocks (GCC is always readable)\n");
++	branch_on(gcc, "gcc_camera_ahb_clk", GCC_CAMERA_AHB);
++	branch_on(gcc, "gcc_camera_xo_clk", GCC_CAMERA_XO);
++	if (last_step < 2) {
++		goto out;
++	}
++
++	/* 2: the first read of the camera clock controller: a hang here means its rail (MMCX) is off, not that the clocks are wrong */
++	say("SWEET CAM: step 2: first read of camcc; if this is the last line, camcc is not reachable (MMCX off?)\n");
++	say("SWEET CAM: camcc reachable: slow_ahb CMD %#x, titan_top GDSCR %#x\n", rd(camcc + CC_SLOW_AHB_RCG), rd(camcc + CC_TITAN_TOP_GDSCR));
++	rcg_tcxo(camcc, "cam_cc_slow_ahb_clk_src", CC_SLOW_AHB_RCG);
++	if (last_step < 3) {
++		goto out;
++	}
++
++	/* 3 */
++	say("SWEET CAM: step 3: gdsc_clk, titan_top GDSC, cpas_ahb, core_ahb\n");
++	branch_on(camcc, "cam_cc_gdsc_clk", CC_GDSC_CLK);
++	gdsc_original = rd(camcc + CC_TITAN_TOP_GDSCR);
++	if (gdsc_original & GDSC_HW_CONTROL) {
++		say("SWEET CAM: titan_top GDSC %#x is under hardware control: not touched, the CCI cannot be reached, stopping\n", gdsc_original);
++		goto out;
++	}
++	if (gdsc_original & GDSC_SW_COLLAPSE) {
++		say("SWEET CAM: titan_top GDSC %#x is collapsed: switching on (SW_COLLAPSE clear)\n", gdsc_original);
++		wr(camcc + CC_TITAN_TOP_GDSCR, gdsc_original & ~GDSC_SW_COLLAPSE);
++		gdsc_changed = true;
++		sleep_us(1);
++		ok = poll(camcc + CC_TITAN_TOP_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, 500, &value);
++		say("SWEET CAM: titan_top GDSC now %#x (%s)\n", value, ok ? "power on" : "PWR_ON NEVER SET after 500 us, stopping");
++		if (!ok) {
++			goto out;
++		}
++		sleep_us(10);
++	} else {
++		say("SWEET CAM: titan_top GDSC %#x was already on: left as it is\n", gdsc_original);
++	}
++	branch_on(camcc, "cam_cc_cpas_ahb_clk", CC_CPAS_AHB);
++	branch_on(camcc, "cam_cc_core_ahb_clk", CC_CORE_AHB);
++	if (last_step < 4) {
++		goto out;
++	}
++
++	/* 4: gpio94 is not muxed to cam_mclk here, so the clock goes nowhere outside the SoC */
++	say("SWEET CAM: step 4: MCLK0 from TCXO 19.2 MHz (gpio94 stays a plain GPIO: no clock on the pin)\n");
++	rcg_tcxo(camcc, "cam_cc_mclk0_clk_src", CC_MCLK0_RCG);
++	branch_on(camcc, "cam_cc_mclk0_clk", CC_MCLK0_BRANCH);
++	if (last_step < 5) {
++		goto out;
++	}
++
++	/* 5 */
++	say("SWEET CAM: step 5: CCI clock from TCXO 19.2 MHz (the DT asks 37.5 MHz from PLL0: not used)\n");
++	rcg_tcxo(camcc, "cam_cc_cci_0_clk_src", CC_CCI0_RCG);
++	branch_on(camcc, "cam_cc_cci_0_clk", CC_CCI0_BRANCH);
++	if (last_step < 6) {
++		goto out;
++	}
++
++	/* 6: the first read of the CCI block */
++	say("SWEET CAM: step 6: first read of the CCI; if this is the last line the CCI is not reachable\n");
++	version = rd(cci + CCI_HW_VERSION);
++	say("SWEET CAM: CCI HW_VERSION %#x (the driver's own read; expected a non-zero version such as 0x10050000 if the block is alive)\n", version);
++	s0 = rd(cci + CCI_IRQ_STATUS_0);
++	s1 = rd(cci + CCI_IRQ_STATUS_1);
++	say("SWEET CAM: CCI before the reset: STATUS_0 %#x STATUS_1 %#x RD_BUF_LEVEL %#x Q0_CUR_WORD_CNT %#x M0_SCL_CTL %#x MASK_0 %#x\n", s0, s1,
++	    rd(cci + CCI_RD_BUF_LEVEL), rd(cci + CCI_Q0_CUR_WORD_CNT), rd(cci + CCI_M0_SCL_CTL), rd(cci + CCI_IRQ_MASK_0));
++	say("SWEET CAM: CCI reset: RESET_CMD %#x, then 1, as the Qualcomm driver does\n", CCI_RESET_RMSK);
++	wr(cci + CCI_RESET_CMD, CCI_RESET_RMSK);
++	wr(cci + CCI_RESET_CMD, 0x1);
++	ok = poll(cci + CCI_IRQ_STATUS_0, CCI_RST_DONE, CCI_RST_DONE, 100000, &value);
++	say("SWEET CAM: CCI reset: STATUS_0 %#x (%s)\n", value, ok ? "RST_DONE seen" : "RST_DONE NOT seen after 100 ms");
++	/* the interrupt masks stay as they are (no interrupt is taken); only the pending bits are cleared */
++	wr(cci + CCI_IRQ_CLEAR_0, value);
++	wr(cci + CCI_IRQ_CLEAR_1, rd(cci + CCI_IRQ_STATUS_1));
++	wr(cci + CCI_IRQ_GLOBAL_CLEAR, 0x1);
++	say("SWEET CAM: CCI after the clear: STATUS_0 %#x STATUS_1 %#x HW_VERSION %#x\n", rd(cci + CCI_IRQ_STATUS_0), rd(cci + CCI_IRQ_STATUS_1),
++	    rd(cci + CCI_HW_VERSION));
++
++out:
++	/* 7 */
++	say("SWEET CAM: step 7: undo\n");
++	undo_all();
++	say("SWEET CAM: camcc after the undo: slow_ahb CMD %#x CFG %#x, MCLK0 branch %#x, CCI0 branch %#x, GDSCR %#x; GCC camera_ahb %#x xo %#x\n",
++	    rd(camcc + CC_SLOW_AHB_RCG), rd(camcc + CC_SLOW_AHB_RCG + 4), rd(camcc + CC_MCLK0_BRANCH), rd(camcc + CC_CCI0_BRANCH),
++	    rd(camcc + CC_TITAN_TOP_GDSCR), rd(gcc + GCC_CAMERA_AHB), rd(gcc + GCC_CAMERA_XO));
++	say("SWEET CAM: done, everything undone\n");
++}
++
++static void
++cam_thread(void *arg, wait_result_t wr_result)
++{
++#pragma unused(arg, wr_result)
++	if (delay_seconds > 0) {
++		delay_for_interval(delay_seconds, NSEC_PER_SEC);
++	}
++	cam_steps();
++	thread_terminate(current_thread());
++}
++
++void
++apollo_cam_init(void);
++
++void
++apollo_cam_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("apollo_cam", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	PE_parse_boot_argn("apollo_cam_delay", &delay_seconds, sizeof(delay_seconds));
++	PE_parse_boot_argn("apollo_cam_step", &last_step, sizeof(last_step));
++	if (delay_seconds > 600) {
++		delay_seconds = 600;
++	}
++	if (last_step > 7) {
++		last_step = 7;
++	}
++	if (kernel_thread_start(cam_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET CAM: no thread: nothing done\n");
++		return;
++	}
++	thread_deallocate(thread);
++	printf("SWEET CAM: armed (apollo_cam=1): in %u s, steps up to %u\n", delay_seconds, last_step);
++}
