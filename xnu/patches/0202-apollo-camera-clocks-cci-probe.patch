@@ -24,7 +24,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,402 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 2 of the bring-up: the clock and bus blocks only.
 + *
@@ -257,6 +257,10 @@
 +	say("SWEET CAM: undoing %u register changes, last first\n", undo_count);
 +	while (undo_count > 0) {
 +		struct undo *u = &undo_list[--undo_count];
++
++		if (u->base == gcc) {      /* the GCC camera AHB/XO stay ON: camcc cannot be read once gcc_camera_ahb_clk is off (external abort: runs of 2026-11-21 panicked there) */
++			continue;
++		}
 +		uint32_t now = rd(u->base + u->offset);
 +
 +		wr(u->base + u->offset, (now & ~u->mask) | (u->original & u->mask));
