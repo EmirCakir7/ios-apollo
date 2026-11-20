@@ -24,7 +24,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,393 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 2 of the bring-up: the clock and bus blocks only.
 + *
@@ -369,6 +369,7 @@
 +	    rd(cci + CCI_HW_VERSION));
 +
 +out:
++	delay_for_interval(12, NSEC_PER_SEC);       /* the kernel log goes to disk every 10 s: let the lines above reach it before the undo, which has hit an SError */
 +	/* 7 */
 +	say("SWEET CAM: step 7: undo\n");
 +	undo_all();
