@@ -1,0 +1,15 @@
+# quiet-on.txt's list plus com.apple.wifip2pd, to be used INSTEAD of quiet-on.txt (same destination: the later list wins, so do not give both).
+#   com.apple.wifip2pd   Wi-Fi peer-to-peer (AWDL, AirDrop, Wi-Fi Direct): started by wifid's request for its service and gone again at
+#                        once, 10-450 times a boot (boots 12x-14x: no crash, no KeepAlive, only a request that finds nothing to do);
+#                        every start is an xpcproxy + exec. Infrastructure Wi-Fi does not need it.
+#   com.apple.fairplayd.H2   (already in quiet-on.txt) exits at launch and, being KeepAlive, is started again every few seconds; a caller
+#                        waiting on its Mach service (Weather's JWT "Mescal" signing, the App Store) waits forever. Boot syslog1 (apollo_syslog=1,
+#                        fastboot boot after a recovery session) still showed 15 exec of it and one exec each of coreduetd, ReportCrash,
+#                        accessoryupdaterd, geod and vmd although the kernel had written this very list ("446 bytes written, error 0") before
+#                        launchd started; boot stuck1 (the permanent image, no recovery before) and boot motion3 showed none. Same labels,
+#                        same file, same exec order up to launchd_cache_loader: why launchd honours the list on some boots only is NOT known
+#                        (the label and the plist format are right: checked against the root image's launchd cache).
+# A disabled job's services are not registered, so a request to it fails at once instead of waiting: Weather should log its error
+# (grep 'Mescal|fairplay|JWT|WDSJWT') instead of going quiet after "Initializing XPC connection AMSDaemonConnection".
+# Undo: quiet-on.txt (without wifip2pd) or bt-on.txt.
+/private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled-fp-wifip2p.plist 0:0:0644
