@@ -1,0 +1,486 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -143,2 +143,3 @@
+ bsd/dev/sweet_i2c_pm8008.c		standard
++bsd/dev/apollo_cam_dev.c		standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -64,2 +64,3 @@
+ extern void apollo_i2c_pm8008_init(void);
++extern void apollo_camdev_init(void);
+ extern void apollo_backlight_init(void);
+@@ -690,2 +691,4 @@
+ 	apollo_i2c_pm8008_init();
++	/* a synthetic test-pattern camera, /dev/apollo-camera (xnu 0205, apollo_cam_dev.c): nothing without the option apollo_camdev=1; no sensor, touches no hardware */
++	apollo_camdev_init();
+ 	apollo_adsp_init();
+--- /dev/null
++++ b/bsd/dev/apollo_cam_dev.c
+@@ -0,0 +1,466 @@
++/*
++ * apollo (Xiaomi Mi 10T / SM8250): camera, step 5 of the bring-up: /dev/apollo-camera with a SYNTHETIC test pattern, no sensor.
++ *
++ * Does NOTHING without the option apollo_camdev=1 (apollo_option(): a boot-arg, else the ADT /sweet-options, as mkadt.py --option
++ * writes it).  With it, a thread of its own makes the character device /dev/apollo-camera (mode 0666) as soon as the root is
++ * mounted, and serves RAW10 frames of colour bars with a moving white bar from a ring of three buffers, while the device is open.
++ * No camera hardware is touched: no clock, no pin, no regulator, no I2C, no CSIPHY, no IFE.  It is for testing the userland path
++ * (mediaserverd's capture device, the software ISP, Camera.app) before the sensor work is done.
++ *
++ * The interface is one this port's own userland speaks; its facts, in short:
++ *
++ *   open(2) O_RDWR.  Frames are produced only while someone has the device open.
++ *
++ *   read(2): ONE FRAME PER CALL = struct apollo_camera_frame (the header, 96 bytes) followed by stride * height bytes of RAW10, the
++ *     newest frame that is newer than the last one this descriptor's device handed out.  A read of just the header's size takes
++ *     the header and no pixels (it still counts as having been given: the next read waits for a newer frame); a read of header +
++ *     stride * height bytes takes both.  Nothing newer for 3 s: EAGAIN (the caller reads again).
++ *   RAW10: groups of four pixels in five bytes; bytes 0..3 are the high eight bits of pixels 0..3, byte 4 holds their low two bits,
++ *     pixel 0 in bits 0-1, pixel 1 in bits 2-3, and so on.  Lines are stride bytes apart, stride = (width * 10 / 8 + 15) & ~15.
++ *     Black level 64, white 1023.  Bayer order 0: the cell is R G / G B (red top left).
++ *   write(2): one struct apollo_camera_command (24 bytes) per call.
++ *     APOLLO_CAMERA_EXPOSURE (a lines, b gain, c frame lines or 0): taken from the next frame on; the pattern's brightness follows
++ *       lines * gain, so a userland auto exposure has a loop to close (500 lines at unity gain is the pattern as it is).
++ *     APOLLO_CAMERA_SENSOR (a sensor 0..3, b mode or ~0): the frames are those of that "sensor" from the next ones on (frames of the
++ *       one before are dropped); the header's sensor says which.  The sensors differ in the pattern's direction only.
++ *     APOLLO_CAMERA_FOCUS (a position): accepted and ignored (the frames' focus is APOLLO_CAMERA_NO_FOCUS).
++ *     anything else, including a short write: EINVAL.
++ *
++ * Options: apollo_camdev_fps (default 15, 1..30), apollo_camdev_width (default 1280, 64..2048, a multiple of 4; the height is
++ * 3/4 of it, even), apollo_camdev_sensor (the sensor the first reader gets, default 1).
++ *
++ * Every line this file prints starts "APOLLO CAMDEV:".
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/conf.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++
++extern kern_return_t thread_terminate(thread_t thread);
++extern int apollo_option(const char *name, int fallback);       /* bsd/dev/apollo_pmic.c (xnu 0181): a boot-arg, else the ADT /sweet-options */
++
++#define APOLLO_CAMERA_MAGIC     "APCAM001"
++#define APOLLO_CAMERA_NO_FOCUS  0xffffffffu
++
++enum {
++	APOLLO_CAMERA_EXPOSURE = 1,
++	APOLLO_CAMERA_SENSOR = 2,
++	APOLLO_CAMERA_FOCUS = 3,
++};
++
++/* what read(2) gives first, 96 bytes, little endian */
++struct apollo_camera_frame {
++	char            magic[8];
++	uint32_t        header_bytes;           /* sizeof this: the pixels follow at this offset */
++	uint32_t        width, height;
++	uint32_t        stride;                 /* bytes from one line to the next */
++	uint32_t        format;                 /* 1: RAW10 */
++	uint32_t        bayer;                  /* 0: R G / G B */
++	uint32_t        black;                  /* the black level, in 10-bit steps */
++	uint32_t        sensor;                 /* 0 macro, 1 wide, 2 front, 3 ultra-wide */
++	uint64_t        sequence;               /* counts up by one for every frame made; one a reader gets can skip */
++	uint64_t        time;                   /* mach_absolute_time() when the frame was made */
++	uint32_t        exposure_lines;         /* the exposure this frame was made with */
++	uint32_t        line_ns;                /* the length of a line */
++	uint32_t        gain;                   /* the analog gain, gain_unity being 1x */
++	uint32_t        gain_unity, gain_max;
++	uint32_t        frame_lines;            /* the frame's length in lines */
++	uint32_t        frame_lines_min, frame_lines_max;
++	uint32_t        margin;                 /* the lines between the longest exposure and the frame's end */
++	uint32_t        focus;                  /* a lens position, or APOLLO_CAMERA_NO_FOCUS */
++};
++
++/* what write(2) takes */
++struct apollo_camera_command {
++	uint32_t        command, a, b, c, d, bytes;
++};
++
++_Static_assert(sizeof(struct apollo_camera_frame) == 96, "the frame header is 96 bytes");
++_Static_assert(sizeof(struct apollo_camera_command) == 24, "the command is 24 bytes");
++
++#define RING                    3
++#define SENSORS                 4
++#define FORMAT_RAW10            1u
++#define BLACK                   64u
++#define WHITE                   1023u
++#define BAR_LEVEL               700u            /* a bar's brightness at the reference exposure, above black */
++#define REF_LINES               500u            /* the exposure (at unity gain) at which the bars are BAR_LEVEL */
++#define GAIN_UNITY              16u
++#define GAIN_MAX                1024u
++#define FRAME_LINES_MIN         1000u
++#define FRAME_LINES_MAX         4000u
++#define EXPOSURE_MARGIN         4u
++#define SCALE_MAX_Q8            (256u * 64u)
++#define BAR_WIDTH_PX            16u
++#define IDLE_WAIT_MS            3000u
++
++enum place_state { PLACE_FREE, PLACE_WRITING, PLACE_READY, PLACE_READING };
++
++struct place {
++	enum place_state state;
++	uint64_t        sequence, time;
++	uint32_t        sensor, lines, gain, frame_lines;
++};
++
++static LCK_GRP_DECLARE(camdev_lock_group, "apollo-camdev");
++static LCK_MTX_DECLARE(camdev_lock, &camdev_lock_group);
++
++static struct place     place[RING];
++static uint8_t          *ring;                  /* RING frames of frame_bytes */
++static uint8_t          *templates;             /* four lines: [ramp * 2 + odd line], stride bytes each */
++static uint32_t         width = 1280, height, stride, frame_bytes, fps = 15;
++static uint32_t         camdev_opens;           /* the opens not yet closed */
++static uint64_t         camdev_sequence;        /* the last frame made */
++static uint64_t         given;                  /* the last frame handed to a reader */
++static uint32_t         sensor_now = 1;
++static uint32_t         epoch;                  /* counts the sensor changes: a frame made across one is dropped */
++static uint32_t         ask_lines = REF_LINES, ask_gain = GAIN_UNITY, ask_frame_lines = 0;
++static uint32_t         lines_now = REF_LINES, gain_now = GAIN_UNITY, frame_lines_now = FRAME_LINES_MIN;
++static bool             ask_pending;
++
++static uint32_t
++camdev_clamp(uint32_t v, uint32_t lo, uint32_t hi)
++{
++	return v < lo ? lo : v > hi ? hi : v;
++}
++
++/* ---- the pattern ------------------------------------------------------------------------------------- */
++
++/* the bars' colours (red 1, green 2, blue 4): white, yellow, cyan, green, magenta, red, blue, black */
++static const uint8_t bar_colour[8] = { 7, 3, 6, 2, 5, 1, 4, 0 };
++
++/* the value of the pixel at x, on an even (odd_line false) or odd line of the Bayer cell, as the sensor `snr` would have it */
++static uint32_t
++camdev_pixel(uint32_t x, bool odd_line, bool ramp, uint32_t pos, uint32_t snr, uint32_t scale_q8)
++{
++	uint32_t site = (odd_line ? 2u : 0u) + (x & 1u);        /* 0 red, 1 and 2 green, 3 blue */
++	uint32_t channel = site == 0 ? 1u : site == 3 ? 4u : 2u;
++	uint32_t level, d;
++
++	if (ramp) {
++		level = (uint32_t)((uint64_t)x * BAR_LEVEL / width);
++	} else {
++		uint32_t bar = (uint32_t)((uint64_t)x * 8 / width);
++
++		if ((snr & 1u) != 0) {
++			bar = 7 - bar;
++		}
++		level = (bar_colour[bar & 7u] & channel) != 0 ? BAR_LEVEL : 0;
++		d = (x + width - pos) % width;
++		if (d < BAR_WIDTH_PX) {
++			level = WHITE - BLACK;
++		}
++	}
++	level = (uint32_t)((uint64_t)level * scale_q8 >> 8);
++	return BLACK + (level > WHITE - BLACK ? WHITE - BLACK : level);
++}
++
++static void
++camdev_line(uint8_t *dst, bool odd_line, bool ramp, uint32_t pos, uint32_t snr, uint32_t scale_q8)
++{
++	for (uint32_t g = 0; g < width / 4; g++) {
++		uint8_t low = 0;
++
++		for (uint32_t i = 0; i < 4; i++) {
++			uint32_t v = camdev_pixel(g * 4 + i, odd_line, ramp, pos, snr, scale_q8);
++
++			dst[g * 5 + i] = (uint8_t)(v >> 2);
++			low |= (uint8_t)((v & 3u) << (i * 2));
++		}
++		dst[g * 5 + 4] = low;
++	}
++}
++
++/* one frame into `dst`: four line templates, copied down the frame */
++static void
++camdev_render(uint8_t *dst, uint64_t number, uint32_t snr, uint32_t lines, uint32_t gain)
++{
++	uint32_t pos = (uint32_t)((number * 8) % width), ramp_from = (height * 3 / 4) & ~1u;
++	uint64_t scale = (uint64_t)lines * gain * 256 / ((uint64_t)REF_LINES * GAIN_UNITY);
++
++	if ((snr & 2u) != 0) {
++		pos = width - 1 - pos;
++	}
++	if (scale > SCALE_MAX_Q8) {
++		scale = SCALE_MAX_Q8;
++	}
++	for (uint32_t t = 0; t < 4; t++) {
++		camdev_line(templates + (size_t)t * stride, (t & 1u) != 0, t >= 2, pos, snr, (uint32_t)scale);
++	}
++	for (uint32_t y = 0; y < height; y++) {
++		memcpy(dst + (size_t)y * stride, templates + (size_t)((y >= ramp_from ? 2u : 0u) + (y & 1u)) * stride, stride);
++	}
++}
++
++/* ---- the generator ------------------------------------------------------------------------------------ */
++
++static void
++camdev_generate(void)
++{
++	uint64_t made = 0;
++
++	for (;;) {
++		int slot = -1;
++		uint32_t snr, lines, gain, frame_lines, my_epoch;
++		uint64_t began;
++
++		lck_mtx_lock(&camdev_lock);
++		while (camdev_opens == 0) {
++			(void)msleep(&camdev_opens, &camdev_lock, PZERO, "apollo-camdev-idle", NULL);
++		}
++		for (int i = 0; i < RING; i++) {
++			if ((place[i].state == PLACE_FREE || place[i].state == PLACE_READY) &&
++			    (slot < 0 || place[i].sequence < place[slot].sequence)) {
++				slot = i;
++			}
++		}
++		if (slot < 0) {
++			lck_mtx_unlock(&camdev_lock);           /* (all being read: try again at the next frame time) */
++			delay_for_interval(1000000u / fps, NSEC_PER_USEC);
++			continue;
++		}
++		place[slot].state = PLACE_WRITING;
++		if (ask_pending) {
++			ask_pending = false;
++			frame_lines_now = camdev_clamp(ask_frame_lines != 0 ? ask_frame_lines : FRAME_LINES_MIN, FRAME_LINES_MIN, FRAME_LINES_MAX);
++			lines_now = camdev_clamp(ask_lines, 1, frame_lines_now - EXPOSURE_MARGIN);
++			gain_now = camdev_clamp(ask_gain, GAIN_UNITY, GAIN_MAX);
++		}
++		snr = sensor_now;
++		lines = lines_now;
++		gain = gain_now;
++		frame_lines = frame_lines_now;
++		my_epoch = epoch;
++		lck_mtx_unlock(&camdev_lock);
++
++		began = mach_absolute_time();
++		camdev_render(ring + (size_t)slot * frame_bytes, made++, snr, lines, gain);
++
++		lck_mtx_lock(&camdev_lock);
++		if (my_epoch == epoch && camdev_opens != 0) {
++			place[slot].sequence = ++camdev_sequence;
++			place[slot].time = began;
++			place[slot].sensor = snr;
++			place[slot].lines = lines;
++			place[slot].gain = gain;
++			place[slot].frame_lines = frame_lines;
++			place[slot].state = PLACE_READY;
++			if (camdev_sequence == 1 || camdev_sequence % 300 == 0) {
++				printf("APOLLO CAMDEV: frame %llu made (sensor %u, %u lines, gain %u)\n", (unsigned long long)camdev_sequence, snr,
++				    lines, gain);
++			}
++		} else {
++			place[slot].state = PLACE_FREE;
++		}
++		lck_mtx_unlock(&camdev_lock);
++		wakeup(&camdev_sequence);
++		delay_for_interval(1000000u / fps, NSEC_PER_USEC);
++	}
++}
++
++/* ---- the device --------------------------------------------------------------------------------------- */
++
++static int
++camdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	lck_mtx_lock(&camdev_lock);
++	camdev_opens++;
++	lck_mtx_unlock(&camdev_lock);
++	wakeup(&camdev_opens);
++	return 0;
++}
++
++static int
++camdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	lck_mtx_lock(&camdev_lock);
++	if (camdev_opens > 0) {
++		camdev_opens--;
++	}
++	if (camdev_opens == 0) {
++		for (int i = 0; i < RING; i++) {
++			if (place[i].state == PLACE_READY) {
++				place[i].state = PLACE_FREE;
++			}
++		}
++	}
++	lck_mtx_unlock(&camdev_lock);
++	return 0;
++}
++
++static int
++camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct apollo_camera_frame f;
++	uint64_t waited_us = 0;
++	int b, error = 0;
++
++	lck_mtx_lock(&camdev_lock);
++	for (;;) {
++		b = -1;
++		for (int i = 0; i < RING; i++) {
++			if (place[i].state == PLACE_READY && place[i].sequence > given && (b < 0 || place[i].sequence > place[b].sequence)) {
++				b = i;
++			}
++		}
++		if (b >= 0) {
++			break;
++		}
++		if (waited_us >= (uint64_t)IDLE_WAIT_MS * 1000) {
++			lck_mtx_unlock(&camdev_lock);
++			return EAGAIN;
++		}
++		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
++
++		error = msleep(&camdev_sequence, &camdev_lock, PZERO | PCATCH, "apollo-camdev", &ts);
++		if (error != 0 && error != EWOULDBLOCK) {
++			lck_mtx_unlock(&camdev_lock);
++			return error;
++		}
++		waited_us += 100000;
++	}
++	place[b].state = PLACE_READING;
++	given = place[b].sequence;
++	bzero(&f, sizeof(f));
++	memcpy(f.magic, APOLLO_CAMERA_MAGIC, 8);
++	f.header_bytes = sizeof(f);
++	f.width = width;
++	f.height = height;
++	f.stride = stride;
++	f.format = FORMAT_RAW10;
++	f.bayer = 0;
++	f.black = BLACK;
++	f.sensor = place[b].sensor;
++	f.sequence = place[b].sequence;
++	f.time = place[b].time;
++	f.exposure_lines = place[b].lines;
++	f.line_ns = 1000000000u / (fps * FRAME_LINES_MIN);
++	f.gain = place[b].gain;
++	f.gain_unity = GAIN_UNITY;
++	f.gain_max = GAIN_MAX;
++	f.frame_lines = place[b].frame_lines;
++	f.frame_lines_min = FRAME_LINES_MIN;
++	f.frame_lines_max = FRAME_LINES_MAX;
++	f.margin = EXPOSURE_MARGIN;
++	f.focus = APOLLO_CAMERA_NO_FOCUS;
++	lck_mtx_unlock(&camdev_lock);
++
++	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
++	if (error == 0 && uio_resid(uio) > 0) {
++		error = uiomove((caddr_t)(ring + (size_t)b * frame_bytes), (int)MIN((uint64_t)frame_bytes, (uint64_t)uio_resid(uio)), uio);
++	}
++	lck_mtx_lock(&camdev_lock);
++	if (place[b].state == PLACE_READING) {
++		place[b].state = PLACE_READY;
++	}
++	lck_mtx_unlock(&camdev_lock);
++	return error;
++}
++
++static int
++camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct apollo_camera_command c;
++	int error;
++
++	if (uio_resid(uio) < (user_ssize_t)sizeof(c) || (error = uiomove((caddr_t)&c, (int)sizeof(c), uio)) != 0) {
++		return EINVAL;
++	}
++	if (c.command == APOLLO_CAMERA_EXPOSURE) {
++		lck_mtx_lock(&camdev_lock);
++		ask_lines = c.a;
++		ask_gain = c.b;
++		ask_frame_lines = c.c;
++		ask_pending = true;
++		lck_mtx_unlock(&camdev_lock);
++		return 0;
++	}
++	if (c.command == APOLLO_CAMERA_FOCUS) {
++		return 0;
++	}
++	if (c.command == APOLLO_CAMERA_SENSOR) {
++		if (c.a >= SENSORS) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&camdev_lock);
++		if (sensor_now != c.a) {
++			sensor_now = c.a;
++			epoch++;
++			for (int i = 0; i < RING; i++) {
++				if (place[i].state == PLACE_READY) {
++					place[i].state = PLACE_FREE;    /* (frames of the sensor before are not given out) */
++				}
++			}
++		}
++		lck_mtx_unlock(&camdev_lock);
++		return 0;
++	}
++	return EINVAL;
++}
++
++static const struct cdevsw camdev_cdevsw = {
++	.d_open = camdev_open, .d_close = camdev_close, .d_read = camdev_read, .d_write = camdev_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++camdev_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	int major;
++
++	/* the node goes into devfs, which is there once the root is mounted: before launchd starts mediaserverd, which looks once */
++	for (unsigned waited = 0; waited < 600 && rootvnode == NULLVP; waited++) {
++		delay_for_interval(100, NSEC_PER_MSEC);
++	}
++	ring = kalloc_data((size_t)RING * frame_bytes, Z_WAITOK | Z_ZERO);
++	templates = kalloc_data((size_t)4 * stride, Z_WAITOK | Z_ZERO);
++	major = ring != NULL && templates != NULL ? cdevsw_add(-1, &camdev_cdevsw) : -1;
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "apollo-camera") == NULL) {
++		printf("APOLLO CAMDEV: /dev/apollo-camera cannot be made\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	printf("APOLLO CAMDEV: /dev/apollo-camera is there: RAW10 %ux%u (stride %u, %u bytes a frame), %u frames a second, test pattern only\n",
++	    width, height, stride, frame_bytes, fps);
++	camdev_generate();
++	thread_terminate(current_thread());
++}
++
++void
++apollo_camdev_init(void);
++
++void
++apollo_camdev_init(void)
++{
++	thread_t thread;
++
++	if (apollo_option("apollo_camdev", 0) == 0) {
++		return;
++	}
++	fps = camdev_clamp((uint32_t)apollo_option("apollo_camdev_fps", (int)fps), 1, 30);
++	width = camdev_clamp((uint32_t)apollo_option("apollo_camdev_width", (int)width), 64, 2048) & ~3u;
++	sensor_now = (uint32_t)apollo_option("apollo_camdev_sensor", (int)sensor_now);
++	if (sensor_now >= SENSORS) {
++		sensor_now = 1;
++	}
++	height = (width * 3 / 4) & ~1u;
++	stride = (width * 10 / 8 + 15) & ~15u;
++	frame_bytes = stride * height;
++	if (kernel_thread_start(camdev_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("APOLLO CAMDEV: no thread: no /dev/apollo-camera\n");
++		return;
++	}
++	thread_deallocate(thread);
++	printf("APOLLO CAMDEV: armed (apollo_camdev=1): /dev/apollo-camera once the root is mounted; a synthetic test pattern, no sensor\n");
++}
