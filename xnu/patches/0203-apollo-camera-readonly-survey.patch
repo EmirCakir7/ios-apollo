@@ -17,7 +17,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_camro.c
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,464 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 3 of the bring-up: a READ-ONLY survey of the power and pin state.
 + *
@@ -69,6 +69,7 @@
 +#define CMD_DB_ENTRY            24u             /* id[8], priority[2], addr, len.16, offset.16 */
 +
 +static uint32_t delay_seconds = 20;
++static int ro_mask = 1;     /* apollo_cam_ro: 1 = all stages; else 2 = cmd-db, 4 = TLMM, 8 = SPMI */
 +
 +static void
 +say_line(const char *line)
@@ -431,12 +432,18 @@
 +{
 +	say("SWEET CAM: ro survey starting (apollo_cam_ro=1): reads only; nothing is written, no I2C slave is addressed, no RPMh vote, no sensor power\n");
 +	delay_for_interval(11, NSEC_PER_SEC);       /* so that the log shows how far we got */
-+	cmd_db_survey();
++	if (ro_mask == 1 || (ro_mask & 2)) {
++		cmd_db_survey();
++	}
 +	delay_for_interval(11, NSEC_PER_SEC);
-+	tlmm_survey();
++	if (ro_mask == 1 || (ro_mask & 4)) {
++		tlmm_survey();
++	}
 +	/* the SPMI arbiter is the part that could stall: let the lines above reach the log disk first (it is written every 10 s) */
 +	delay_for_interval(11, NSEC_PER_SEC);
-+	spmi_survey();
++	if (ro_mask == 1 || (ro_mask & 8)) {
++		spmi_survey();
++	}
 +	say("SWEET CAM: ro survey done: nothing was written\n");
 +	delay_for_interval(12, NSEC_PER_SEC);       /* the lines above reach the disk */
 +}
@@ -460,7 +467,8 @@
 +{
 +	thread_t thread;
 +
-+	if (apollo_option("apollo_cam_ro", 0) == 0) {
++	ro_mask = apollo_option("apollo_cam_ro", 0);
++	if (ro_mask == 0) {
 +		return;
 +	}
 +	delay_seconds = (uint32_t)apollo_option("apollo_cam_ro_delay", (int)delay_seconds);
