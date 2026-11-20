@@ -17,7 +17,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_camro.c
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,449 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 3 of the bring-up: a READ-ONLY survey of the power and pin state.
 + *
@@ -283,7 +283,8 @@
 +		    tile_name[pin_tile[p]], c, i, (c >> 2) & 0xfu, pull_name[c & 3u], (((c >> 6) & 7u) + 1u) * 2u, (c >> 9) & 1u, i & 1u, (i >> 1) & 1u);
 +	}
 +}
-++/* ---- 3: PM8150L (SPMI slave 4) GPIO1, by the SPMI arbiter's observer (as bsd/dev/sweet_spmi.c) ----------------------- */
++
++/* ---- 3: PM8150L (SPMI slave 4) GPIO1, by the SPMI arbiter's observer (as bsd/dev/sweet_spmi.c) ----------------------- */
 +static vm_offset_t sp_core, sp_obs, sp_cfg;
 +static unsigned sp_count;
 +static bool sp_timed_out;
