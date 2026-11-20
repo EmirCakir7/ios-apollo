@@ -17,7 +17,7 @@
  	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
 --- /dev/null
 +++ b/bsd/dev/sweet_camro.c
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,448 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 3 of the bring-up: a READ-ONLY survey of the power and pin state.
 + *
@@ -260,46 +260,30 @@
 +tlmm_survey(void)
 +{
 +	static const uint32_t tile_pa[3] = { TLMM_WEST_PA, TLMM_SOUTH_PA, TLMM_NORTH_PA };
-+	vm_offset_t tile[3];
-+	unsigned t, p;
++	unsigned p;
 +
-+	say("SWEET CAM: tlmm: reading CFG and IN_OUT of the camera pins in the west/south/north tiles (reads only)\n");
-+	for (t = 0; t < 3; t++) {
-+		tile[t] = ml_io_map(tile_pa[t], TLMM_TILE_SIZE);
-+		if (tile[t] == 0) {
-+			say("SWEET CAM: tlmm: FAILED to map the %s tile (%#x)\n", tile_name[t], tile_pa[t]);
-+		}
-+	}
++	say("SWEET CAM: tlmm: reading CFG and IN_OUT of the camera pins, one 4 KiB page per pin, in the pin's own tile (reads only)\n");
 +	for (p = 0; p < sizeof(pin_gpio) / sizeof(pin_gpio[0]); p++) {
-+		uint32_t cfg[3] = { 0, 0, 0 }, io[3] = { 0, 0, 0 };
-+		int pick = -1;
++		uint32_t pa = tile_pa[pin_tile[p]] + 0x1000u * pin_gpio[p];
++		vm_offset_t va;
++		uint32_t c, i;
 +
-+		say("SWEET CAM: tlmm: about to read gpio%u in the %s tile\n", pin_gpio[p], tile_name[pin_tile[p]]);
-+		delay_for_interval(11, NSEC_PER_SEC);   /* if the next read hangs, this is the last line in the log */
-+		for (t = 0; t < 3; t++) {
-+			if (tile[t] == 0 || t != pin_tile[p]) {
-+				continue;
-+			}
-+			cfg[t] = rd(tile[t] + TLMM_GPIO_CFG(pin_gpio[p]));
-+			io[t] = rd(tile[t] + TLMM_GPIO_IN_OUT(pin_gpio[p]));
-+			if (pick < 0 && (cfg[t] | io[t]) != 0) {
-+				pick = (int)t;
-+			}
++		say("SWEET CAM: tlmm: gpio%u: mapping %#x\n", pin_gpio[p], pa);
++		delay_for_interval(11, NSEC_PER_SEC);   /* if the next step hangs, this is the last line in the log */
++		va = ml_io_map(pa, 0x1000);
++		if (va == 0) {
++			say("SWEET CAM: tlmm: gpio%u: FAILED to map %#x\n", pin_gpio[p], pa);
++			continue;
 +		}
-+		if (pick < 0) {
-+			say("SWEET CAM: gpio%u %s: west cfg %#x io %#x south cfg %#x io %#x north cfg %#x io %#x | all zero: in no tile\n", pin_gpio[p],
-+			    pin_name[p], cfg[0], io[0], cfg[1], io[1], cfg[2], io[2]);
-+		} else {
-+			uint32_t c = cfg[pick], i = io[pick];
-+
-+			say("SWEET CAM: gpio%u %s: west cfg %#x io %#x south cfg %#x io %#x north cfg %#x io %#x | tile %s func %u pull %s drive %u mA oe %u in %u out %u\n",
-+			    pin_gpio[p], pin_name[p], cfg[0], io[0], cfg[1], io[1], cfg[2], io[2], tile_name[pick], (c >> 2) & 0xfu, pull_name[c & 3u],
-+			    (((c >> 6) & 7u) + 1u) * 2u, (c >> 9) & 1u, i & 1u, (i >> 1) & 1u);
-+		}
++		say("SWEET CAM: tlmm: gpio%u: mapped, reading\n", pin_gpio[p]);
++		delay_for_interval(11, NSEC_PER_SEC);
++		c = rd(va);
++		i = rd(va + 4);
++		say("SWEET CAM: gpio%u %s: %s tile cfg %#x io %#x | func %u pull %s drive %u mA oe %u in %u out %u\n", pin_gpio[p], pin_name[p],
++		    tile_name[pin_tile[p]], c, i, (c >> 2) & 0xfu, pull_name[c & 3u], (((c >> 6) & 7u) + 1u) * 2u, (c >> 9) & 1u, i & 1u, (i >> 1) & 1u);
 +	}
 +}
-+
-+/* ---- 3: PM8150L (SPMI slave 4) GPIO1, by the SPMI arbiter's observer (as bsd/dev/sweet_spmi.c) ----------------------- */
+++/* ---- 3: PM8150L (SPMI slave 4) GPIO1, by the SPMI arbiter's observer (as bsd/dev/sweet_spmi.c) ----------------------- */
 +static vm_offset_t sp_core, sp_obs, sp_cfg;
 +static unsigned sp_count;
 +static bool sp_timed_out;
