@@ -93,7 +93,7 @@ FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System
                  # the sound (tools/root-files/audio-on.txt): iOS's VirtualAudio.plugin and our HakiosAudio.driver
                  '/Library/Audio/Plug-Ins/', '/System/Library/Audio/Plug-Ins/HAL/',
                  # app extensions that cannot work without Metal (tools/root-files/aegir-off.txt)
-                 '/System/Library/ExtensionKit/',
+                 '/System/Library/ExtensionKit/', '/System/Library/CoreServices/AegirProxyApp.app/',
                  # Sileo moved among the system apps (tools/root-files/sileo-system.txt)
                  '/Applications/',
                  # the Metal plug-in Metal.framework loads (tools/root-files/metal2-on.txt; xnu 0170 sweetmtl=2)
