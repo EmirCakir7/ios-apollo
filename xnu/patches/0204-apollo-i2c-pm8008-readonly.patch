@@ -17,7 +17,7 @@
  	apollo_adsp_init();
 --- /dev/null
 +++ b/bsd/dev/sweet_i2c_pm8008.c
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,702 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 4 of the bring-up: a READ-ONLY look at the camera PMIC (pm8008) over I2C.
 + *
@@ -620,8 +620,17 @@
 +	int clk_sel = 0;
 +
 +	say("SWEET I2C: starting; reads only, nothing is written to any slave, gpio77 and the rails are never driven\n");
-+	south = ml_io_map(TLMM_SOUTH_PA, TLMM_TILE_SIZE);
-+	north = ml_io_map(TLMM_NORTH_PA, TLMM_TILE_SIZE);
++	delay_for_interval(11, NSEC_PER_SEC);       /* so that the log shows that the thread got here */
++	/* only the pages of the pins used (the large mapping of a whole tile froze the phone, see 0203): the base is kept as the tile's, so
++	 * that tile + 0x1000 * gpio still addresses the pin */
++	south = ml_io_map(TLMM_SOUTH_PA + 0x1000u * PIN_SDA, 0x2000);
++	north = ml_io_map(TLMM_NORTH_PA + 0x1000u * PIN_PM8008_EN, 0x1000);
++	if (south != 0) {
++		south -= 0x1000u * PIN_SDA;
++	}
++	if (north != 0) {
++		north -= 0x1000u * PIN_PM8008_EN;
++	}
 +	gcc = ml_io_map(GCC_PA, GCC_SIZE);
 +	se = ml_io_map(SE_PA, SE_SIZE);
 +	if (south == 0 || north == 0 || gcc == 0 || se == 0) {
