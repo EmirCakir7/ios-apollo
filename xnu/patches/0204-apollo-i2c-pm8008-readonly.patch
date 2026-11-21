@@ -17,7 +17,7 @@
  	apollo_adsp_init();
 --- /dev/null
 +++ b/bsd/dev/sweet_i2c_pm8008.c
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,736 @@
 +/*
 + * apollo (Xiaomi Mi 10T / SM8250): camera, step 4 of the bring-up: a READ-ONLY look at the camera PMIC (pm8008) over I2C.
 + *
@@ -157,6 +157,7 @@
 +#define XFER_TIMEOUT_US         100000u         /* one I2C transaction */
 +
 +static uint32_t delay_seconds = 25;
++static int i2c_mode = 1;     /* apollo_i2c_pm8008: 1 = reads only; 2 = also switch the pm8008 chip on (gpio77 high) for the reads, off again at the end */
 +
 +static void
 +say_line(const char *line)
@@ -667,8 +668,17 @@
 +	enable_io = rd(north + TLMM_GPIO_IN_OUT(PIN_PM8008_EN));
 +	say("SWEET I2C: gpio77 (pm8008 chip enable): level %u (CFG %#x IN_OUT %#x), read only\n", enable_io & 1u, enable_cfg, enable_io);
 +	if ((enable_io & 1u) == 0) {
-+		say("SWEET I2C: gpio77 is LOW: the pm8008 is not enabled; stopping, nothing was touched (this file never enables the chip)\n");
-+		return;
++		if (i2c_mode < 2) {
++			say("SWEET I2C: gpio77 is LOW: the pm8008 is not enabled; stopping, nothing was touched (apollo_i2c_pm8008=2 would switch the chip on)\n");
++			return;
++		}
++		/* the camera PMIC's own enable pin: no sensor rail is switched, the chip's regulators stay off (their enable bits are never written) */
++		say("SWEET I2C: apollo_i2c_pm8008=2: switching the pm8008 chip ON: gpio77 -> output, high; it goes back low at the end\n");
++		delay_for_interval(11, NSEC_PER_SEC);
++		change(north, TLMM_GPIO_IN_OUT(PIN_PM8008_EN), 2u, 2u);        /* output level high first */
++		change(north, TLMM_GPIO_CFG(PIN_PM8008_EN), 1u << 9, 1u << 9);   /* then output enable */
++		sleep_us(20000);
++		say("SWEET I2C: gpio77 now CFG %#x IN_OUT %#x\n", rd(north + TLMM_GPIO_CFG(PIN_PM8008_EN)), rd(north + TLMM_GPIO_IN_OUT(PIN_PM8008_EN)));
 +	}
 +
 +	/* 3: the bus lines, read before the pin function is changed */
@@ -677,8 +687,8 @@
 +	say("SWEET I2C: gpio48 (SDA) CFG %#x level %u, gpio49 (SCL) CFG %#x level %u\n", rd(south + TLMM_GPIO_CFG(PIN_SDA)), sda_io & 1u,
 +	    rd(south + TLMM_GPIO_CFG(PIN_SCL)), scl_io & 1u);
 +	if ((sda_io & 1u) == 0 || (scl_io & 1u) == 0) {
-+		say("SWEET I2C: an I2C line is LOW (no pull-up rail, or the bus is held): stopping, nothing was touched\n");
-+		return;
++		say("SWEET I2C: an I2C line is LOW (no pull-up rail, or the bus is held): stopping\n");
++		goto out;
 +	}
 +
 +	/* 4 */
@@ -729,7 +739,8 @@
 +{
 +	thread_t thread;
 +
-+	if (apollo_option("apollo_i2c_pm8008", 0) == 0) {
++	i2c_mode = apollo_option("apollo_i2c_pm8008", 0);
++	if (i2c_mode == 0) {
 +		return;
 +	}
 +	delay_seconds = (uint32_t)apollo_option("apollo_i2c_pm8008_delay", (int)delay_seconds);
